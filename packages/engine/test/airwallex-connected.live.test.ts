@@ -1,6 +1,4 @@
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { type ProgramSpecInput, presetInputs } from '@novate/policy';
 import { AirwallexRail } from '@novate/rails';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -8,14 +6,21 @@ import {
   provisionMember,
   recordRailOpening,
   runCycle,
-  runReconciliation,
   submitFact,
 } from '../src/index.ts';
-import { boot, eur, makeWorld, shutdown, type World, waitFor } from './harness.ts';
+import {
+  boot,
+  eur,
+  makeWorld,
+  netProgram,
+  reconcile,
+  shutdown,
+  type World,
+  waitFor,
+} from './harness.ts';
 
-const envFile = new URL('../../../.env', import.meta.url).pathname;
-if (existsSync(envFile)) process.loadEnvFile(envFile);
 const { AIRWALLEX_CLIENT_ID, AIRWALLEX_API_KEY } = process.env;
+// Each run creates real sandbox accounts, which are limited, so only `pnpm test:live` runs it.
 const live = Boolean(AIRWALLEX_CLIENT_ID && AIRWALLEX_API_KEY);
 
 const address = {
@@ -91,24 +96,23 @@ describe.skipIf(!live)('net settlement with connected accounts (live)', () => {
   });
   let engine: Engine;
   beforeAll(async () => {
-    engine = await boot(rail);
+    // A real rail is retried and polled at production pace.
+    engine = await boot(rail, [], { pace: 1 });
   }, 120_000);
   afterAll(() => shutdown());
 
-  const net: ProgramSpecInput = {
-    ...presetInputs.netSettlement,
-    overrides: [],
+  const net = netProgram({
     settlement: {
       netting: 'multilateral',
       rail: 'airwallex',
       fundingWindow: '2m',
       confirmWithin: '1h',
     },
-  };
+  });
 
   const open = async (w: World, memberId: string) => {
     const tag = randomUUID().slice(0, 8);
-    await provisionMember(w.tenantId, memberId, {
+    await provisionMember(w.tenantId, w.house, memberId, {
       idempotencyKey: randomUUID(),
       rail: 'airwallex',
       countryCode: 'US',
@@ -156,6 +160,6 @@ describe.skipIf(!live)('net settlement with connected accounts (live)', () => {
 
     expect((await runCycle(w.tenantId)).status).toBe('settled');
     await waitFor(deal.id, ['settled'], 120_000);
-    expect(await runReconciliation(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
+    expect(await reconcile(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
   }, 300_000);
 });

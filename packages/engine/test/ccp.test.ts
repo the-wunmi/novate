@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { marginCalls } from '@novate/db';
+import { Accounts } from '@novate/ledger';
 import { type ProgramSpecInput, presetInputs } from '@novate/policy';
 import { MockRail } from '@novate/rails';
 import { eq } from 'drizzle-orm';
@@ -16,11 +17,21 @@ import {
   memberMargin,
   monitorWorkflow,
   runCycle,
-  runReconciliation,
   submitFact,
   unattributedDepositsOf,
 } from '../src/index.ts';
-import { boot, brain, eur, gbp, makeWorld, notified, shutdown, waitFor } from './harness.ts';
+import {
+  boot,
+  brain,
+  controlEventsOf,
+  eur,
+  gbp,
+  makeWorld,
+  notified,
+  reconcile,
+  shutdown,
+  waitFor,
+} from './harness.ts';
 
 const rail = new MockRail({ pull: false });
 const orphans = new MockRail({ name: 'orphans' });
@@ -57,7 +68,8 @@ const makeOverdue = (callId: string | undefined) =>
 
 /** Commit a member's free money elsewhere, so a later call cannot be met from its wallet. */
 async function tieUpWallet(w: World, memberId: string, currency: string) {
-  await contributeToDefaultFund(w.tenantId, {
+  await contributeToDefaultFund(w.tenantId, w.person, {
+    reason: 'Test contribution',
     memberId,
     currency,
     amount: await w.available(memberId, currency),
@@ -131,7 +143,8 @@ describe('central counterparty', () => {
     const w = await makeWorld(rail, { ccp });
     await w.fund(w.brand, 'GBP', gbp('700'));
     await w.fund(w.retailer, 'EUR', eur('5000'));
-    await contributeToDefaultFund(w.tenantId, {
+    await contributeToDefaultFund(w.tenantId, w.person, {
+      reason: 'Test contribution',
       memberId: w.retailer,
       currency: 'EUR',
       amount: eur('2000'),
@@ -153,6 +166,11 @@ describe('central counterparty', () => {
     await makeOverdue(openCall?.id);
     expect((await monitor(w.tenantId)).portfolio.defaults).toBe(1);
     await expect.poll(() => notified.some((n) => n.type === 'member_defaulted')).toBe(true);
+    const [closeOnly] = await controlEventsOf(w.tenantId, 'member_close_only');
+    expect(closeOnly).toMatchObject({
+      actor: { kind: 'system', via: 'system' },
+      payload: { memberId: w.brand, marginCallId: openCall?.id },
+    });
 
     // Close-only: a new position is refused, but the open one still has to settle.
     const refused = await buy(w, 1, '1');
@@ -172,13 +190,13 @@ describe('central counterparty', () => {
     // Collateral went first, sold for euros. The fund made up the rest, and the house lost nothing.
     expect(await margin(w, w.brand)).toBe(0n);
     expect(rail.conversions.at(-1)).toMatchObject({ sellCurrency: 'GBP', buyCurrency: 'EUR' });
-    const fund = (await balances(w.tenantId, w.retailer)).find((b) =>
-      b.code.endsWith(':default_fund'),
+    const fund = (await balances(w.tenantId, w.retailer)).find(
+      (b) => b.kind === 'default_fund',
     )?.balance;
     expect(fund).toBeLessThan(eur('2000'));
     expect(fund).toBeGreaterThan(eur('1000'));
-    const house = await deps().ledger.balances(deps().db as never, w.tenantId, 'house:EUR:');
-    expect(house.find((a) => a.code.endsWith(':default_loss'))?.balance ?? 0n).toBe(0n);
+    const loss = Accounts.houseDefaultLoss('EUR');
+    expect(await deps().ledger.balance(deps().db as never, w.tenantId, loss)).toBe(0n);
     expect((await dealDetail(d.id, w.platform)).deal.status).toBe('settled');
   });
 
@@ -295,15 +313,21 @@ describe('deposits nobody can be matched to', () => {
       await expect.poll(() => held(w.tenantId), { timeout: 15_000 }).toBeDefined();
       const row = await held(w.tenantId);
       expect(row?.amount).toBe(eur('300'));
-      expect((await runReconciliation(w.tenantId, 'orphans')).status).toBe('clean');
+      expect((await reconcile(w.tenantId, 'orphans')).status).toBe('clean');
 
       const before = await w.available(w.retailer, 'EUR');
-      await assignDeposit(w.tenantId, row?.id as string, { memberId: w.retailer });
+      await assignDeposit(w.tenantId, w.person, row?.id as string, {
+        memberId: w.retailer,
+        reason: 'matched by hand',
+      });
       expect((await w.available(w.retailer, 'EUR')) - before).toBe(eur('300'));
       await expect(
-        assignDeposit(w.tenantId, row?.id as string, { memberId: w.retailer }),
+        assignDeposit(w.tenantId, w.person, row?.id as string, {
+          memberId: w.retailer,
+          reason: 'matched by hand',
+        }),
       ).rejects.toThrow('already assigned');
-      expect((await runReconciliation(w.tenantId, 'orphans')).status).toBe('clean');
+      expect((await reconcile(w.tenantId, 'orphans')).status).toBe('clean');
     } finally {
       delete deps().railOwners.orphans;
     }
@@ -318,8 +342,8 @@ describe('deposits nobody can be matched to', () => {
       await expect.poll(() => held(w.tenantId), { timeout: 15_000 }).toBeDefined();
       await webhook('deposit.reversed', externalRef);
       await expect.poll(() => held(w.tenantId), { timeout: 15_000 }).toBeUndefined();
-      const house = await deps().ledger.balances(deps().db as never, w.tenantId, 'house:');
-      expect(house.find((a) => a.code === 'house:EUR:suspense')?.balance ?? 0n).toBe(0n);
+      const suspense = Accounts.houseSuspense('EUR');
+      expect(await deps().ledger.balance(deps().db as never, w.tenantId, suspense)).toBe(0n);
     } finally {
       delete deps().railOwners.orphans;
     }

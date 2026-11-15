@@ -1,4 +1,16 @@
-import { toJson } from '@novate/core';
+import {
+  type CaseDecision,
+  type ControlActor,
+  type FactData,
+  PRINCIPAL_KINDS,
+  type RecordMetadata,
+  type StoredAction,
+  type StoredDealTerms,
+  type StoredMandate,
+  type StoredTenantSettings,
+  toJson,
+  USER_ROLES,
+} from '@novate/core';
 import { sql } from 'drizzle-orm';
 import {
   bigint,
@@ -30,6 +42,11 @@ const jsonb = customType<{ data: unknown; driverData: string }>({
   dataType: () => 'jsonb',
   toDriver: toJson,
 });
+/** A Postgres transaction id, 64 bits, so it never wraps. */
+const xid8 = customType<{ data: bigint; driverData: string }>({
+  dataType: () => 'xid8',
+  fromDriver: (v) => BigInt(v),
+});
 
 // ── Tenancy ────────────────────────────────────────────────────────────────
 
@@ -40,6 +57,8 @@ export const tenants = pgTable('tenants', {
   /** Set when reconciliation or an operator stops new settlement for this tenant. */
   settlementHaltedAt: timestamp('settlement_halted_at', { withTimezone: true }),
   settlementHaltReason: text('settlement_halt_reason'),
+  /** Controls the house sets for itself, read through `TenantSettings`. Changed only with a control event. */
+  settings: jsonb('settings').$type<StoredTenantSettings>().notNull().default({}),
   createdAt: createdAt(),
 });
 
@@ -125,6 +144,7 @@ export const cardPayments = pgTable(
     uniqueIndex('card_payments_one_open_uq').on(t.dealId).where(sql`${t.status} = 'open'`),
     index('card_payments_intent_idx').on(t.intentId),
     index('card_payments_tenant_status_idx').on(t.tenantId, t.status),
+    index('card_payments_attempt_ref_idx').on(t.attemptRef),
   ],
 );
 
@@ -149,15 +169,114 @@ export const apiKeys = pgTable(
       .references(() => tenants.id),
     keyHash: text('key_hash').notNull(),
     name: text('name').notNull(),
-    principal: text('principal', {
-      enum: ['platform', 'house', 'member', 'agent', 'inspector', 'carrier', 'arbiter'],
-    }).notNull(),
+    principal: text('principal', { enum: PRINCIPAL_KINDS }).notNull(),
     memberId: uuid('member_id').references(() => members.id),
     agentId: uuid('agent_id').references(() => agents.id),
     revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    revokedBy: jsonb('revoked_by').$type<ControlActor>(),
+    createdBy: jsonb('created_by').$type<ControlActor>().notNull(),
+    /** Moved forward at most once a minute. */
+    lastUsedAt: timestamp('last_used_at', { withTimezone: true }),
     createdAt: createdAt(),
   },
   (t) => [uniqueIndex('api_keys_hash_uq').on(t.keyHash)],
+);
+
+// ── People ─────────────────────────────────────────────────────────────────
+
+/**
+ * A person who signs in to the console. Keys are for machines; people have accounts. Never
+ * deleted, so every user id recorded on an action still names someone.
+ */
+export const users = pgTable(
+  'users',
+  {
+    id: id(),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
+    /** Lowercased, unique within the tenant. */
+    email: text('email').notNull(),
+    name: text('name').notNull(),
+    role: text('role', { enum: USER_ROLES }).notNull(),
+    memberId: uuid('member_id').references(() => members.id),
+    /** `scrypt$N$r$p$salt$hash`. Null until an invite is accepted. */
+    passwordHash: text('password_hash'),
+    /** AES-256-GCM under `NOVATE_SECRET_KEY`. Set at setup, in use once `totpEnabledAt` is. */
+    totpSecret: text('totp_secret'),
+    totpEnabledAt: timestamp('totp_enabled_at', { withTimezone: true }),
+    /** The last step a code was accepted for, so no code works twice. */
+    totpLastStep: bigint('totp_last_step', { mode: 'number' }),
+    status: text('status', { enum: ['invited', 'active', 'disabled'] })
+      .notNull()
+      .default('invited'),
+    createdAt: createdAt(),
+    createdBy: jsonb('created_by').$type<ControlActor>().notNull(),
+    lastLoginAt: timestamp('last_login_at', { withTimezone: true }),
+    failedLogins: integer('failed_logins').notNull().default(0),
+    lockedUntil: timestamp('locked_until', { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex('users_tenant_email_uq').on(t.tenantId, t.email),
+    index('users_email_idx').on(t.email),
+    check('users_email_lowercase', sql`${t.email} = lower(${t.email})`),
+    check('users_member_role', sql`(${t.role} = 'member') = (${t.memberId} is not null)`),
+  ],
+);
+
+/** A link that lets a person set their password. Only the token's hash is stored. */
+export const userInvites = pgTable(
+  'user_invites',
+  {
+    id: id(),
+    tokenHash: text('token_hash').notNull(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id),
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    usedAt: timestamp('used_at', { withTimezone: true }),
+    createdBy: jsonb('created_by').$type<ControlActor>().notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    uniqueIndex('user_invites_token_uq').on(t.tokenHash),
+    index('user_invites_user_idx').on(t.userId),
+  ],
+);
+
+/** Why a session was ended before it expired. */
+export const SESSION_ENDS = [
+  'signed_out',
+  'password_changed',
+  'user_disabled',
+  'user_reset',
+  'invite_accepted',
+] as const;
+
+/** A signed-in browser. The cookie holds the token; only its sha256 is stored. */
+export const sessions = pgTable(
+  'sessions',
+  {
+    idHash: text('id_hash').primaryKey(),
+    userId: uuid('user_id')
+      .notNull()
+      .references(() => users.id),
+    createdAt: createdAt(),
+    /** Absolute: twelve hours after sign-in, however active. */
+    expiresAt: timestamp('expires_at', { withTimezone: true }).notNull(),
+    /** Idle timeout is measured from here. Moved forward at most once a minute. */
+    lastSeenAt: timestamp('last_seen_at', { withTimezone: true }).notNull().defaultNow(),
+    ip: text('ip'),
+    userAgent: text('user_agent'),
+    revokedAt: timestamp('revoked_at', { withTimezone: true }),
+    /** Why it was revoked. Set exactly when `revokedAt` is. */
+    endedReason: text('ended_reason', { enum: SESSION_ENDS }),
+  },
+  (t) => [
+    index('sessions_user_idx').on(t.userId, t.createdAt.desc()),
+    index('sessions_expires_idx').on(t.expiresAt),
+    check('sessions_ended_reason', sql`(${t.revokedAt} is null) = (${t.endedReason} is null)`),
+  ],
 );
 
 /** A business trading on a tenant's platform. */
@@ -175,7 +294,22 @@ export const members = pgTable(
       .default('active'),
     /** Rail-specific references, e.g. Airwallex connected account id. */
     railRefs: jsonb('rail_refs').$type<Record<string, string>>().notNull().default({}),
+    /** When `railRefs` last changed, which for a provisioned member is when its accounts opened. */
+    railRefsChangedAt: timestamp('rail_refs_changed_at', { withTimezone: true }),
     attributes: jsonb('attributes').$type<Record<string, unknown>>().notNull().default({}),
+    /** Onboarding facts the platform keeps about the business. */
+    legalName: text('legal_name'),
+    /** ISO 3166-1 alpha-2. */
+    country: text('country'),
+    contactEmail: text('contact_email'),
+    /**
+     * The member's own four eyes: per currency, minor units as strings, a withdrawal its people ask
+     * for above this waits for a second of its users. A currency not listed is never held.
+     */
+    withdrawalFourEyesAbove: jsonb('withdrawal_four_eyes_above')
+      .$type<Record<string, string>>()
+      .notNull()
+      .default({}),
     createdAt: createdAt(),
   },
   (t) => [index('members_tenant_idx').on(t.tenantId)],
@@ -193,7 +327,7 @@ export const agents = pgTable(
       .references(() => members.id),
     name: text('name').notNull(),
     /** Validated against core `Mandate`. Amounts stored as strings of minor units. */
-    mandate: jsonb('mandate').$type<Record<string, unknown>>().notNull(),
+    mandate: jsonb('mandate').$type<StoredMandate>().notNull(),
     status: text('status', { enum: ['active', 'blocked'] })
       .notNull()
       .default('active'),
@@ -215,9 +349,85 @@ export const programs = pgTable(
     version: integer('version').notNull(),
     /** Validated against policy `ProgramSpec`. Immutable once written. */
     spec: jsonb('spec').$type<Record<string, unknown>>().notNull(),
+    /** Who published this version. */
+    createdBy: jsonb('created_by').$type<ControlActor>().notNull(),
+    /** Why, in the publisher's words. */
+    note: text('note'),
     createdAt: createdAt(),
   },
   (t) => [uniqueIndex('programs_key_version_uq').on(t.tenantId, t.key, t.version)],
+);
+
+// ── Control actions (append-only audit) ────────────────────────────────────
+
+/** Every control action on a tenant, who took it and why. Never changed. */
+export const controlEvents = pgTable(
+  'control_events',
+  {
+    id: id(),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
+    type: text('type', {
+      enum: [
+        'settlement_stopped',
+        'settlement_resumed',
+        'opening_recorded',
+        'program_published',
+        'agent_suspended',
+        'agent_reinstated',
+        'agent_mandate_changed',
+        'case_assigned',
+        'case_unassigned',
+        'rail_refs_changed',
+        'manual_credit',
+        'deposit_assigned',
+        'member_suspended',
+        'member_reinstated',
+        'member_close_only',
+        'key_issued',
+        'key_revoked',
+        'break_resolved',
+        'books_signed_off',
+        'member_added',
+        'agent_added',
+        'user_invited',
+        'user_disabled',
+        'user_enabled',
+        'user_login_locked',
+        'user_reset',
+        'invite_accepted',
+        'user_signed_in',
+        'two_step_enabled',
+        'two_step_disabled',
+        'password_changed',
+        'withdrawal_requested',
+        'default_fund_moved',
+        'approval_requested',
+        'approval_approved',
+        'approval_rejected',
+        'settings_changed',
+        'member_updated',
+        'provision_requested',
+        'break_assigned',
+        'break_unassigned',
+        'payout_refreshed',
+        'member_controls_changed',
+      ],
+    }).notNull(),
+    actor: jsonb('actor').$type<ControlActor>().notNull(),
+    reason: text('reason'),
+    payload: jsonb('payload').$type<Record<string, unknown>>().notNull().default({}),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index('control_events_tenant_idx').on(t.tenantId, t.createdAt, t.id),
+    index('control_events_type_idx').on(t.tenantId, t.type, t.createdAt),
+    /** One sign-off per business day; a later one must name the one it supersedes. */
+    uniqueIndex('control_events_sign_off_uq')
+      .on(t.tenantId, sql`(${t.payload}->>'date')`)
+      .where(sql`${t.type} = 'books_signed_off' and not (${t.payload} ? 'supersedes')`),
+  ],
 );
 
 // ── Deals ──────────────────────────────────────────────────────────────────
@@ -260,7 +470,7 @@ export const deals = pgTable(
     currency: text('currency').notNull(),
     amount: money('amount').notNull(),
     quantity: integer('quantity').notNull(),
-    terms: jsonb('terms').$type<Record<string, unknown>>().notNull(),
+    terms: jsonb('terms').$type<StoredDealTerms>().notNull(),
     status: dealStatus('status').notNull().default('submitted'),
     /** Resolved policy + the signal values it was resolved from. Written once, at acceptance. */
     policySnapshot: jsonb('policy_snapshot').$type<Record<string, unknown>>(),
@@ -276,7 +486,6 @@ export const deals = pgTable(
     fundingCurrency: text('funding_currency'),
     marginCurrency: text('margin_currency'),
     statusReason: text('status_reason'),
-    /** Which trusted agent key signed a submission of this deal, if one did. */
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
@@ -284,7 +493,9 @@ export const deals = pgTable(
     uniqueIndex('deals_idempotency_uq').on(t.tenantId, t.idempotencyKey),
     index('deals_buyer_idx').on(t.buyerMemberId),
     index('deals_seller_idx').on(t.sellerMemberId),
-    index('deals_buyer_agent_idx').on(t.buyerAgentId),
+    index('deals_tenant_created_idx').on(t.tenantId, t.createdAt, t.id),
+    index('deals_buyer_agent_idx').on(t.buyerAgentId, t.currency, t.createdAt),
+    index('deals_seller_agent_idx').on(t.sellerAgentId, t.currency, t.createdAt),
     check('deals_amount_positive', sql`${t.amount} > 0`),
   ],
 );
@@ -294,18 +505,68 @@ export const dealEvents = pgTable(
   'deal_events',
   {
     id: id(),
-    /** The order events were written in, for a feed that can be read from where it stopped. */
+    /** The order events were written in within their transaction. */
     seq: bigserial('seq', { mode: 'bigint' }).notNull(),
+    /**
+     * The writing transaction. The feed reads in (xid, seq) order and only from transactions every
+     * snapshot already sees as finished, so an event can never appear behind a reader's cursor.
+     */
+    xid: xid8('xid').notNull().default(sql`pg_current_xact_id()`),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
     dealId: uuid('deal_id')
       .notNull()
       .references(() => deals.id),
-    type: text('type').notNull(),
+    type: text('type', {
+      enum: [
+        'authority_failed',
+        'awaiting_conditions',
+        'awaiting_funding',
+        'cancelled',
+        'card_funded',
+        'card_refused',
+        'check_rejected',
+        'claim_closed',
+        'claim_paid',
+        'claim_filed',
+        'claim_refunded',
+        'conditions_evaluated',
+        'confirmed',
+        'cycle_failed',
+        'deferred_by_decision',
+        'deferred_by_default',
+        'escrow_locked',
+        'exception',
+        'fact_added',
+        'frozen',
+        'held',
+        'held_for_evidence',
+        'locks_planned',
+        'mandate_proof',
+        'margin_call_failed',
+        'margin_drawn',
+        'margin_locked',
+        'margin_resized',
+        'netted',
+        'policy_resolved',
+        'refunded',
+        'released',
+        'repriced',
+        'settled',
+        'submitted',
+        'verified',
+        'waived',
+        'x402_refused',
+      ],
+    }).notNull(),
     payload: jsonb('payload').$type<Record<string, unknown>>().notNull().default({}),
     createdAt: createdAt(),
   },
   (t) => [
     index('deal_events_deal_idx').on(t.dealId, t.createdAt),
-    index('deal_events_seq_idx').on(t.seq),
+    index('deal_events_feed_idx').on(t.tenantId, t.xid, t.seq),
+    uniqueIndex('deal_events_seq_idx').on(t.seq),
   ],
 );
 
@@ -320,7 +581,7 @@ export const dealFacts = pgTable(
     kind: text('kind').notNull(),
     type: text('type').notNull(),
     source: text('source').notNull(),
-    data: jsonb('data').$type<Record<string, unknown>>().notNull(),
+    data: jsonb('data').$type<FactData>().notNull(),
     createdAt: createdAt(),
   },
   (t) => [index('deal_facts_deal_idx').on(t.dealId)],
@@ -345,17 +606,23 @@ export const decisionCases = pgTable(
     shown: jsonb('shown').$type<Record<string, unknown>>().notNull(),
     /** Inputs needed to validate an action later: amount, ceiling, limits, findings. */
     context: jsonb('context').$type<Record<string, unknown>>().notNull(),
+    /** sha256 of `context` when the case opened, so the limits the gate used are bound too. */
+    contextHash: text('context_hash').notNull(),
     status: text('status', { enum: ['open', 'decided', 'expired', 'stale'] })
       .notNull()
       .default('open'),
-    resolution: jsonb('resolution').$type<Record<string, unknown>>(),
+    resolution: jsonb('resolution').$type<CaseDecision>(),
     /** Too early to judge how this turned out. Look again after this. */
     judgeAfter: timestamp('judge_after', { withTimezone: true }),
+    /** Who has taken the case, so two people do not work the same one. */
+    assignee: jsonb('assignee').$type<ControlActor>(),
+    assignedAt: timestamp('assigned_at', { withTimezone: true }),
     createdAt: createdAt(),
     closedAt: timestamp('closed_at', { withTimezone: true }),
   },
   (t) => [
     index('decision_cases_tenant_idx').on(t.tenantId, t.status),
+    index('decision_cases_tenant_created_idx').on(t.tenantId, t.createdAt, t.id),
     index('decision_cases_deal_idx').on(t.dealId),
   ],
 );
@@ -370,12 +637,25 @@ export const decisionRecords = pgTable(
       .references(() => decisionCases.id),
     deciderType: text('decider_type', { enum: ['rule', 'model', 'person', 'system'] }).notNull(),
     deciderId: text('decider_id').notNull(),
-    action: jsonb('action').$type<Record<string, unknown>>().notNull(),
+    action: jsonb('action').$type<StoredAction>().notNull(),
     rationale: text('rationale').notNull(),
     bindingHash: text('binding_hash').notNull(),
     accepted: integer('accepted').notNull(),
-    violations: jsonb('violations').$type<string[]>().notNull().default([]),
-    metadata: jsonb('metadata').$type<Record<string, unknown>>().notNull().default({}),
+    /**
+     * Every rule code applied to the proposal, passed or not, as `ActionCheck`. Refusals are the
+     * failed ones. None when the decider never answered.
+     */
+    checks: jsonb('checks')
+      .$type<
+        {
+          code: string;
+          params?: Record<string, string>;
+          passed: boolean;
+          measure?: { amount: string; limit: string | null; currency: string };
+        }[]
+      >()
+      .notNull(),
+    metadata: jsonb('metadata').$type<RecordMetadata>().notNull().default({}),
     createdAt: createdAt(),
   },
   (t) => [index('decision_records_case_idx').on(t.caseId)],
@@ -397,14 +677,26 @@ export const decisionOutcomes = pgTable(
     signals: jsonb('signals').$type<Record<string, unknown>>().notNull(),
     /** Null for decisions that belong to no one program, such as a reconciliation break. */
     programKey: text('program_key'),
-    amount: money('amount').notNull().default(sql`0`),
-    currency: text('currency').notNull().default(''),
+    amount: money('amount').notNull(),
+    currency: text('currency').notNull(),
     /** The two members of the deal, sorted, so one pair's successes can be capped. */
     pair: text('pair'),
     createdAt: createdAt(),
   },
   (t) => [index('decision_outcomes_tenant_kind_idx').on(t.tenantId, t.kind, t.createdAt)],
 );
+
+/** What a replay found, counted over the decisions it replayed. */
+export interface ShadowSummary {
+  replayed: number;
+  same: number;
+  changed: number;
+  toPerson: number;
+  /** The original went badly and the candidate would have done something else. */
+  wouldHaveFixed: number;
+  /** The original went well and the candidate would have done something else. */
+  wouldHaveChanged: number;
+}
 
 /** Past decisions replayed against a candidate. Moves no money and changes no case. */
 export const shadowRuns = pgTable(
@@ -418,7 +710,7 @@ export const shadowRuns = pgTable(
       .notNull()
       .default('running'),
     candidate: jsonb('candidate').$type<Record<string, unknown>>().notNull(),
-    summary: jsonb('summary').$type<Record<string, unknown>>(),
+    summary: jsonb('summary').$type<ShadowSummary>(),
     createdAt: createdAt(),
     finishedAt: timestamp('finished_at', { withTimezone: true }),
   },
@@ -442,7 +734,11 @@ export const shadowResults = pgTable(
     rationale: text('rationale'),
     /** How the original decision turned out, if that is known yet. */
     verdict: text('verdict', { enum: ['good', 'bad', 'neutral'] }),
-    violations: jsonb('violations').$type<string[]>().notNull().default([]),
+    /** The failed checks of the candidate's last refused proposal, as `ActionCheck`. */
+    refused: jsonb('refused')
+      .$type<{ code: string; params?: Record<string, string>; passed: boolean }[]>()
+      .notNull()
+      .default([]),
     createdAt: createdAt(),
   },
   (t) => [uniqueIndex('shadow_results_run_case_uq').on(t.runId, t.caseId)],
@@ -486,6 +782,9 @@ export const obligations = pgTable(
   ],
 );
 
+export const CYCLE_KINDS = ['settlement', 'withdrawal'] as const;
+export type CycleKind = (typeof CYCLE_KINDS)[number];
+
 export const cycles = pgTable(
   'cycles',
   {
@@ -498,12 +797,23 @@ export const cycles = pgTable(
     })
       .notNull()
       .default('netting'),
+    /** A settlement cycle nets a settlement group; a withdrawal is a one-payment cycle. */
+    kind: text('kind', { enum: CYCLE_KINDS }).notNull(),
+    /** Set on a settlement cycle only. */
     settlementGroup: text('settlement_group'),
     summary: jsonb('summary').$type<Record<string, unknown>>(),
+    /** Who asked for a withdrawal. Set on a withdrawal only. */
+    requestedBy: jsonb('requested_by').$type<ControlActor>(),
     createdAt: createdAt(),
     closedAt: timestamp('closed_at', { withTimezone: true }),
   },
-  (t) => [index('cycles_tenant_idx').on(t.tenantId)],
+  (t) => [
+    index('cycles_tenant_idx').on(t.tenantId, t.createdAt, t.id),
+    check(
+      'cycles_kind_shape',
+      sql`(${t.kind} = 'settlement') = (${t.settlementGroup} IS NOT NULL) AND (${t.kind} = 'withdrawal') = (${t.requestedBy} IS NOT NULL)`,
+    ),
+  ],
 );
 
 export const settlementInstructions = pgTable(
@@ -532,13 +842,17 @@ export const settlementInstructions = pgTable(
     externalRef: text('external_ref'),
     idempotencyKey: text('idempotency_key').notNull(),
     failureReason: text('failure_reason'),
+    /** When a payout that could not be sent was credited back to the member's wallet. */
+    returnedToWalletAt: timestamp('returned_to_wallet_at', { withTimezone: true }),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
   },
   (t) => [
     uniqueIndex('settlement_instructions_idem_uq').on(t.idempotencyKey),
     index('settlement_instructions_cycle_idx').on(t.cycleId),
-    index('settlement_instructions_ref_idx').on(t.externalRef),
+    // Rail events look an instruction up by ref alone; reconciliation adds the tenant.
+    index('settlement_instructions_ref_idx').on(t.externalRef, t.tenantId),
+    index('settlement_instructions_member_idx').on(t.tenantId, t.memberId, t.direction, t.status),
     check('settlement_instructions_amount_positive', sql`${t.amount} > 0`),
   ],
 );
@@ -568,7 +882,10 @@ export const fxConversions = pgTable(
     idempotencyKey: text('idempotency_key').notNull(),
     createdAt: createdAt(),
   },
-  (t) => [uniqueIndex('fx_conversions_idem_uq').on(t.idempotencyKey)],
+  (t) => [
+    uniqueIndex('fx_conversions_idem_uq').on(t.idempotencyKey),
+    index('fx_conversions_ref_idx').on(t.tenantId, t.externalRef),
+  ],
 );
 
 /** Rates sampled from a rail over time, from which volatility is measured. */
@@ -697,6 +1014,19 @@ export const railCursors = pgTable('rail_cursors', {
   position: bigint('position', { mode: 'bigint' }).notNull(),
 });
 
+/** What a reconciliation run recorded. Amounts are minor units, as strings. */
+export type ReconRunSummary =
+  /** What the account already held, per currency, that belongs to no member. */
+  | { kind: 'opening'; balances: Record<string, string> }
+  | {
+      kind: 'comparison';
+      transactions: number;
+      /** Rail fees on known money, booked as house costs. */
+      fees: number;
+      /** Each currency as the ledger and the rail saw it, and what of it the opening holds. */
+      positions: { currency: string; ledger: string; rail: string; atOpening: string }[];
+    };
+
 /** One comparison of the ledger with what a rail reports. */
 export const reconRuns = pgTable(
   'recon_runs',
@@ -708,10 +1038,12 @@ export const reconRuns = pgTable(
     rail: text('rail').notNull(),
     /** `opening` records what the account already held when the rail was connected. */
     status: text('status', { enum: ['clean', 'breaks', 'failed', 'opening'] }).notNull(),
-    summary: jsonb('summary').$type<Record<string, unknown>>().notNull().default({}),
+    /** Differences found. None for an opening. */
+    breakCount: integer('break_count').notNull(),
+    summary: jsonb('summary').$type<ReconRunSummary>().notNull(),
     createdAt: createdAt(),
   },
-  (t) => [index('recon_runs_tenant_idx').on(t.tenantId, t.createdAt)],
+  (t) => [index('recon_runs_tenant_idx').on(t.tenantId, t.createdAt, t.id)],
 );
 
 export const reconBreaks = pgTable(
@@ -731,13 +1063,177 @@ export const reconBreaks = pgTable(
     expected: money('expected').notNull(),
     actual: money('actual').notNull(),
     externalRef: text('external_ref'),
-    detail: jsonb('detail').$type<Record<string, unknown>>().notNull().default({}),
+    /** What the rail called the transaction, when the difference is one novate did not make. */
+    detail: jsonb('detail')
+      .$type<{ railType?: string; occurredAt?: string }>()
+      .notNull()
+      .default({}),
     createdAt: createdAt(),
   },
-  (t) => [index('recon_breaks_run_idx').on(t.runId)],
+  (t) => [
+    index('recon_breaks_run_idx').on(t.runId),
+    index('recon_breaks_tenant_idx').on(t.tenantId, t.createdAt),
+  ],
+);
+
+/** How a reconciliation break was closed, and by whom. A break with no row here is still open. */
+export const reconBreakResolutions = pgTable(
+  'recon_break_resolutions',
+  {
+    id: id(),
+    breakId: uuid('break_id')
+      .notNull()
+      .references(() => reconBreaks.id),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
+    resolution: text('resolution', {
+      enum: ['posted', 'explained', 'written_off', 'opening_rebased'],
+    }).notNull(),
+    actor: jsonb('actor').$type<ControlActor>().notNull(),
+    reason: text('reason').notNull(),
+    /** What closed it: a ledger batch, a control event, a case. */
+    reference: text('reference'),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    uniqueIndex('recon_break_resolutions_break_uq').on(t.breakId),
+    index('recon_break_resolutions_tenant_idx').on(t.tenantId, t.createdAt),
+  ],
+);
+
+/**
+ * Who owns a reconciliation break. Append-only: the latest row for a break says who holds it, and a
+ * row with no assignee lets it go.
+ */
+export const reconBreakAssignments = pgTable(
+  'recon_break_assignments',
+  {
+    id: id(),
+    breakId: uuid('break_id')
+      .notNull()
+      .references(() => reconBreaks.id),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
+    assignee: jsonb('assignee').$type<ControlActor>(),
+    actor: jsonb('actor').$type<ControlActor>().notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [index('recon_break_assignments_break_idx').on(t.breakId, t.createdAt)],
+);
+
+/**
+ * An action held for a second person: a manual credit, a write-off, a person's case decision past
+ * the program ceiling, a new rail opening, or a change of where a member is paid. What would run is kept here; the decision is its own
+ * row, at most one per request, and the action runs in the same transaction as an approval.
+ * Append-only.
+ */
+export const approvalRequests = pgTable(
+  'approval_requests',
+  {
+    id: id(),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
+    kind: text('kind', {
+      enum: [
+        'manual_credit',
+        'break_write_off',
+        'case_decision',
+        'rail_opening',
+        'rail_refs',
+        'member_withdrawal',
+        'member_controls',
+      ],
+    }).notNull(),
+    /** Set when the request is a member's own, which only that member's users may decide. */
+    memberId: uuid('member_id').references(() => members.id),
+    actor: jsonb('actor').$type<ControlActor>().notNull(),
+    /** The parsed input of the original action, replayed as is on approval. */
+    payload: jsonb('payload').$type<Record<string, unknown>>().notNull(),
+    /** What it moves or hides, when that is one amount. An opening holds its amounts in `payload`. */
+    amount: money('amount'),
+    currency: text('currency'),
+    reason: text('reason').notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    index('approval_requests_tenant_idx').on(t.tenantId, t.createdAt),
+    index('approval_requests_member_idx').on(t.memberId, t.createdAt),
+    check('approval_requests_amount', sql`(${t.amount} is null) = (${t.currency} is null)`),
+  ],
+);
+
+export const approvalDecisions = pgTable(
+  'approval_decisions',
+  {
+    id: id(),
+    requestId: uuid('request_id')
+      .notNull()
+      .references(() => approvalRequests.id),
+    tenantId: uuid('tenant_id')
+      .notNull()
+      .references(() => tenants.id),
+    decision: text('decision', { enum: ['approved', 'rejected'] }).notNull(),
+    actor: jsonb('actor').$type<ControlActor>().notNull(),
+    reason: text('reason'),
+    createdAt: createdAt(),
+  },
+  (t) => [uniqueIndex('approval_decisions_request_uq').on(t.requestId)],
+);
+
+/**
+ * Every earlier version of a settlement instruction, conversion, rail event or tenant, written by
+ * trigger whenever one is changed or removed, so what was paid and when cannot be rewritten without
+ * trace. Append-only.
+ */
+export const rowHistory = pgTable(
+  'row_history',
+  {
+    id: bigserial('id', { mode: 'bigint' }).primaryKey(),
+    tableName: text('table_name').notNull(),
+    rowId: text('row_id').notNull(),
+    op: text('op', { enum: ['UPDATE', 'DELETE'] }).notNull(),
+    old: jsonb('old').$type<Record<string, unknown>>().notNull(),
+    /** The row after an update; null for a delete. */
+    new: jsonb('new').$type<Record<string, unknown>>(),
+    at: timestamp('at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index('row_history_row_idx').on(t.tableName, t.rowId)],
 );
 
 // ── Ledger (double-entry, append-only) ─────────────────────────────────────
+
+/**
+ * What a ledger account is for. Together with its owner columns this is how readers find accounts;
+ * the code is only the unique key.
+ */
+export const LEDGER_ACCOUNT_KINDS = [
+  // A member's own: set `member_id`.
+  'available',
+  'debt',
+  'default_fund',
+  'portfolio_margin',
+  // A member's position in one cycle: set `cycle_id` and `member_id`.
+  'settlement',
+  // Locked against one deal: set `deal_id`.
+  'escrow',
+  'margin',
+  // The house's on one rail: set `rail`.
+  'cash',
+  'in_flight',
+  'fees_paid',
+  // The house's in one currency.
+  'rail_fees',
+  'house_fee_revenue',
+  'platform_fee_revenue',
+  'clearing',
+  'fx',
+  'suspense',
+  'default_loss',
+] as const;
+export type LedgerAccountKind = (typeof LEDGER_ACCOUNT_KINDS)[number];
 
 export const ledgerAccounts = pgTable(
   'ledger_accounts',
@@ -746,8 +1242,13 @@ export const ledgerAccounts = pgTable(
     tenantId: uuid('tenant_id')
       .notNull()
       .references(() => tenants.id),
-    /** Stable human key, e.g. `member:<id>:EUR:available`, `deal:<id>:escrow`. */
+    /** Stable human key, e.g. `member:<id>:EUR:available`, `deal:<id>:EUR:escrow`. */
     code: text('code').notNull(),
+    kind: text('kind', { enum: LEDGER_ACCOUNT_KINDS }).notNull(),
+    memberId: uuid('member_id'),
+    dealId: uuid('deal_id'),
+    cycleId: uuid('cycle_id'),
+    rail: text('rail'),
     currency: text('currency').notNull(),
     /** Liability accounts (what the house owes) are credit-normal; asset accounts are debit-normal. */
     normal: text('normal', { enum: ['credit', 'debit'] }).notNull(),
@@ -759,6 +1260,10 @@ export const ledgerAccounts = pgTable(
   },
   (t) => [
     uniqueIndex('ledger_accounts_code_uq').on(t.tenantId, t.code),
+    index('ledger_accounts_member_idx').on(t.tenantId, t.memberId),
+    index('ledger_accounts_deal_idx').on(t.tenantId, t.dealId),
+    index('ledger_accounts_cycle_idx').on(t.tenantId, t.cycleId),
+    index('ledger_accounts_kind_idx').on(t.tenantId, t.kind),
     check(
       'ledger_accounts_overdraft',
       sql`${t.noOverdraft} = 0 OR (CASE WHEN ${t.normal} = 'credit' THEN ${t.creditsPosted} - ${t.debitsPosted} ELSE ${t.debitsPosted} - ${t.creditsPosted} END) >= 0`,
@@ -786,13 +1291,16 @@ export const ledgerTransfers = pgTable(
     amount: money('amount').notNull(),
     kind: text('kind').notNull(),
     ref: text('ref'),
+    /** The settlement instruction this transfer carries out, if any. */
+    instructionId: uuid('instruction_id').references(() => settlementInstructions.id),
     createdAt: createdAt(),
   },
   (t) => [
     uniqueIndex('ledger_transfers_idem_uq').on(t.tenantId, t.idempotencyKey),
-    index('ledger_transfers_debit_idx').on(t.debitAccountId),
-    index('ledger_transfers_credit_idx').on(t.creditAccountId),
-    index('ledger_transfers_ref_idx').on(t.ref),
+    index('ledger_transfers_debit_idx').on(t.debitAccountId, t.createdAt, t.id),
+    index('ledger_transfers_credit_idx').on(t.creditAccountId, t.createdAt, t.id),
+    index('ledger_transfers_ref_idx').on(t.tenantId, t.ref),
+    index('ledger_transfers_kind_idx').on(t.tenantId, t.kind, t.createdAt),
     check('ledger_transfers_amount_positive', sql`${t.amount} > 0`),
     check('ledger_transfers_distinct', sql`${t.debitAccountId} <> ${t.creditAccountId}`),
   ],

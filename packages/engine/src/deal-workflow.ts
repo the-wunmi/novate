@@ -19,6 +19,7 @@ import {
   evaluateCondition,
   type Finding,
   type Funding,
+  findingsReason,
   type Margin,
   ProgramSpec,
   type ResolvedPolicy,
@@ -33,7 +34,9 @@ import { railRefusal, resolveForDeal, shapeProblem, signalSubject } from './deal
 import { type CaseSpec, dealCase, resolveCase } from './decisions.ts';
 import { deps, isWorkflowControl, networkStep, pollWhileSubmitted, tryPost, tx } from './deps.ts';
 import { deposit } from './funds.ts';
+import { notify } from './notifications.ts';
 import { assessMembers, marginCoversDeal } from './portfolio-margin.ts';
+import { impliedRateE8, rateLabel, rateString } from './rates.ts';
 import {
   type DealRow,
   escrowCurrency,
@@ -126,6 +129,9 @@ async function runDeal(dealId: string): Promise<Terminal> {
     await tx('unwind', (db) => unwind(db, deal, 'refunded', 'nothing to release', true));
     return 'refunded';
   }
+  if (released < deal.amount) {
+    await notifySeller(deal, released, 'reduced', 'Only part of the deal was released');
+  }
 
   if (resolved.policy.settlement.timing.mode === 'immediate') {
     const cycleId = stableUuid(`immediate:${deal.id}`);
@@ -137,7 +143,7 @@ async function runDeal(dealId: string): Promise<Terminal> {
   while (true) {
     const msg = await DBOS.recv<SettlementMessage>(Topics.settled, { timeoutSeconds: 86_400 });
     if (msg?.type === 'settled') {
-      await tx('settled', (db) => completeDeal(db, deal, msg.cycleId));
+      await tx('settled', (db) => completeDeal(db, deal, msg.cycleId, released));
       return 'settled';
     }
     if (msg?.type === 'cure_expired') {
@@ -239,7 +245,7 @@ async function authorise(
 
 async function reject(
   deal: DealRow,
-  type: string,
+  type: 'authority_failed' | 'check_rejected',
   payload: Record<string, unknown>,
   reasons: string[],
 ): Promise<Terminal> {
@@ -312,7 +318,7 @@ async function repriceDeal(db: Tx, deal: DealRow, lines: DealLine[]): Promise<De
     })
     .where(eq(deals.id, deal.id))
     .returning();
-  await record(db, deal.id, 'repriced', { from: deal.amount, to: amount });
+  await record(db, deal.id, 'repriced', { from: deal.amount, to: amount, currency: deal.currency });
   return row as DealRow;
 }
 
@@ -397,6 +403,31 @@ function lockAmount(deal: DealRow, kind: LockKind, bps: number): bigint {
   return applyBps(converted, 10_000 + buffer);
 }
 
+/**
+ * How a lock held in another currency was sized, both rates as units of the deal's currency per 1
+ * of the lock's: `marketRate` as quoted, `rate` after the FX buffer, which is what the member paid.
+ */
+function lockFx(deal: DealRow, kind: LockKind, bps: number) {
+  const currency = lockCurrency(deal, kind);
+  if (currency === deal.currency) return {};
+  const market = BigInt(snapshotOf(deal).lockRates[currency] as string);
+  const { funding } = snapshotOf(deal).resolved.policy;
+  const effective =
+    impliedRateE8(
+      lockAmount(deal, kind, bps),
+      currency,
+      applyBps(deal.amount, bps),
+      deal.currency,
+    ) ?? market;
+  return {
+    dealCurrency: deal.currency,
+    rate: rateString(effective),
+    rateLabel: rateLabel(currency, deal.currency, effective),
+    marketRate: rateString(market),
+    bufferBps: 'fxBufferBps' in funding ? funding.fxBufferBps : 0,
+  };
+}
+
 /** Lock `bps` of the deal from the buyer (escrow) or seller (margin), waiting for deposits. */
 async function lockWithWait(
   deal: DealRow,
@@ -464,6 +495,7 @@ async function pullShortfall(
   } catch (err) {
     // The same idempotency key goes out next time round, so an unanswered pull cannot double up.
     if (isWorkflowControl(err)) throw err;
+    console.warn(`Pull for deal ${deal.id} got no answer:`, (err as Error).message);
     return false;
   }
   if (result.status !== 'confirmed') return false;
@@ -492,7 +524,12 @@ async function lockFunds(db: Tx, deal: DealRow, kind: LockKind, bps: number): Pr
     },
   ]);
   if (!posted) return false;
-  await record(db, deal.id, `${kind}_locked`, { amount, currency, bps });
+  await record(db, deal.id, `${kind}_locked`, {
+    amount,
+    currency,
+    bps,
+    ...lockFx(deal, kind, bps),
+  });
   return true;
 }
 
@@ -568,15 +605,26 @@ async function reviewHeldDeal(
   result: ConditionResult,
   expired: boolean,
 ): Promise<HeldReview> {
-  const reason = expired
-    ? 'Release conditions timed out'
-    : result.findings.map((f) => f.message).join('; ');
+  const reason = expired ? 'Release conditions timed out' : findingsReason(result.findings);
   const marginPosted = await tx('held', async (db) => {
-    await setStatus(db, deal.id, 'held', { type: 'held', payload: { reason } }, reason);
+    await setStatus(
+      db,
+      deal.id,
+      'held',
+      {
+        type: 'held',
+        payload: {
+          reason,
+          findings: result.findings.map(({ code, message, factId }) => ({ code, message, factId })),
+        },
+      },
+      reason,
+    );
     return deal.marginCurrency
       ? deps().ledger.balance(db, deal.tenantId, lockAccount(deal, 'margin'))
       : 0n;
   });
+  await notifySeller(deal, 0n, 'held', reason);
   const res = await resolveCase(
     dealCase(
       deal,
@@ -685,8 +733,10 @@ async function waive(db: Tx, deal: DealRow, findings: Finding[]) {
   await setStatus(db, deal.id, 'awaiting_conditions', { type: 'waived', payload: { codes } }, null);
 }
 
-/** Pay the buyer out of the seller's margin. Keys are per amount held, so draws can repeat. */
-/** `occasion` makes the entry unique: the balance can return to the same figure after a top-up. */
+/**
+ * Pay the buyer out of the seller's margin. The key is per `occasion`, so a replay posts once and a
+ * later draw still posts, even when the balance has returned to the same figure after a top-up.
+ */
 async function drawMargin(db: Tx, deal: DealRow, occasion: string, amount: bigint, reason: string) {
   if (!deal.marginCurrency || amount === 0n) return;
   const { ledger } = deps();
@@ -712,6 +762,20 @@ async function drawMargin(db: Tx, deal: DealRow, occasion: string, amount: bigin
 }
 
 // ── Release and close ──────────────────────────────────────────────────────
+
+/** The seller is the one waiting on this money, so it hears when it gets less, or not yet. */
+const notifySeller = (deal: DealRow, amount: bigint, status: 'reduced' | 'held', reason: string) =>
+  notify({
+    type: 'payment_reduced',
+    tenantId: deal.tenantId,
+    memberId: deal.sellerMemberId,
+    dealId: deal.id,
+    currency: deal.currency,
+    expected: deal.amount.toString(),
+    amount: amount.toString(),
+    status,
+    reason,
+  });
 
 async function releaseFunds(
   db: Tx,
@@ -794,7 +858,13 @@ async function releaseFunds(
     'eligible',
     {
       type: 'released',
-      payload: { amount, of: deal.amount, forced: forcedBps !== undefined, late },
+      payload: {
+        amount,
+        currency: deal.currency,
+        of: deal.amount,
+        forced: forcedBps !== undefined,
+        late,
+      },
     },
     null,
   );
@@ -856,7 +926,17 @@ async function unwind(
     db,
     deal.id,
     status,
-    { type: status, payload: { reason, escrowReturned: held, marginReturned, forfeited: forfeit } },
+    {
+      type: status,
+      payload: {
+        reason,
+        escrowReturned: held,
+        currency: lockCurrency(deal, 'escrow'),
+        marginReturned,
+        marginCurrency: lockCurrency(deal, 'margin'),
+        forfeited: forfeit,
+      },
+    },
     reason,
   );
 }
@@ -869,7 +949,7 @@ async function refundUncured(db: Tx, deal: DealRow, sellerAtFault: boolean): Pro
   return true;
 }
 
-async function completeDeal(db: Tx, deal: DealRow, cycleId: string) {
+async function completeDeal(db: Tx, deal: DealRow, cycleId: string, paid: bigint) {
   const { ledger } = deps();
   const margin = lockAccount(deal, 'margin');
   const posted = await ledger.balance(db, deal.tenantId, margin);
@@ -889,7 +969,16 @@ async function completeDeal(db: Tx, deal: DealRow, cycleId: string) {
     db,
     deal.id,
     'settled',
-    { type: 'settled', payload: { cycleId, marginReturned: posted } },
+    {
+      type: 'settled',
+      payload: {
+        cycleId,
+        amount: paid,
+        currency: deal.currency,
+        marginReturned: posted,
+        marginCurrency: lockCurrency(deal, 'margin'),
+      },
+    },
     null,
   );
 }

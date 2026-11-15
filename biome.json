@@ -26,6 +26,16 @@
   },
   "overrides": [
     {
+      "includes": ["apps/console/**/*.css"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noDescendingSpecificity": "off"
+          }
+        }
+      }
+    },
+    {
       "includes": ["**/test/**"],
       "linter": {
         "rules": {

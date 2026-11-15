@@ -8,11 +8,11 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   type Engine,
   ingestRailEvent,
+  listDeals,
   payDealByCard,
   resolveStuckCardPayments,
-  runReconciliation,
 } from '../src/index.ts';
-import { boot, makeWorld, shutdown, type World, waitFor } from './harness.ts';
+import { boot, makeWorld, reconcile, shutdown, type World, waitFor } from './harness.ts';
 
 const rail = new MockRail();
 let engine: Engine;
@@ -75,6 +75,7 @@ describe('funding a deal with a card credential', () => {
     expect((await pay(w, dealId, id)).status).toBe('succeeded');
     expect(rail.cardsCharged.length).toBe(charged + 1);
     expect((await eventsOf(dealId)).filter((e) => e.type === 'card_funded')).toHaveLength(1);
+    expect((await listDeals(w.tenantId)).rows.find((d) => d.id === dealId)?.funding).toBe('card');
   });
 
   it('never writes the card to either database', async () => {
@@ -241,12 +242,12 @@ describe('card money on its way to the rail', () => {
     const id = mandate();
     await pay(w, dealId, id);
 
-    const before = await runReconciliation(w.tenantId, 'mock');
+    const before = await reconcile(w.tenantId, 'mock');
     expect(before.breaks.filter((b) => b.currency === 'EUR')).toEqual([]);
 
     const row = await paymentOf(id);
     rail.settleCard(row.intentId as string, 150n);
-    const after = await runReconciliation(w.tenantId, 'mock');
+    const after = await reconcile(w.tenantId, 'mock');
     expect(after.breaks.filter((b) => b.externalRef === row.attemptRef)).toEqual([]);
     expect(after.breaks.filter((b) => b.kind === 'balance_mismatch')).toEqual([]);
     expect((await paymentOf(id)).settledAt).toBeTruthy();

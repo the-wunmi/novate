@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline/promises';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { serve } from '@hono/node-server';
 import { createMetalPaymentClient } from '@metalntwx/metal-pay';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -10,7 +11,6 @@ import { fromMajor } from '@novate/core';
 import { createPool } from '@novate/db';
 import { runMigrations } from '@novate/db/migrate';
 import {
-  createHouseKey,
   launchEngine,
   PostgresMetalAttempts,
   pollRailsNow,
@@ -21,6 +21,10 @@ import { presetInputs } from '@novate/policy';
 import { AirwallexRail, createMetalClient, MetalRail, RailRegistry } from '@novate/rails';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { createApp } from './app.ts';
+import { ensureDemoUsers } from './demo-users.ts';
+import { authFromEnv } from './env.ts';
+import { fundStablecoinBuyer } from './metal-buyer.ts';
+import { until } from './wait.ts';
 import { metalGateway } from './x402.ts';
 
 /**
@@ -36,7 +40,6 @@ const WEBHOOK_PATIENCE_MS = 40_000;
 const reader = paced ? createInterface({ input: process.stdin, output: process.stdout }) : null;
 
 const paint = (code: number, text: string) => `\x1b[${code}m${text}\x1b[0m`;
-const sleep = (ms: number) => new Promise((done) => setTimeout(done, ms));
 let chapterNumber = 0;
 async function chapter(title: string) {
   if (reader) await reader.question(paint(2, '\n  press Enter to continue '));
@@ -51,16 +54,6 @@ const euros = (minor: string | bigint) =>
   new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'EUR' }).format(
     Number(minor) / 100,
   );
-
-async function until<T>(what: string, check: () => Promise<T | undefined>, timeoutMs = 180_000) {
-  const stop = Date.now() + timeoutMs;
-  for (;;) {
-    const value = await check();
-    if (value !== undefined) return value;
-    if (Date.now() > stop) throw new Error(`Gave up waiting for ${what}`);
-    await sleep(700);
-  }
-}
 
 function databaseUrl(name: string): string {
   const url = new URL(process.env.DATABASE_URL as string);
@@ -96,35 +89,6 @@ async function openTunnel(): Promise<{ url: string; process: ChildProcess }> {
     child.on('error', () => failed(new Error('cloudflared is not installed')));
   });
   return { url, process: child };
-}
-
-/** Throwaway buyer money, sent before novate opens its books on the rail. */
-async function fundStablecoinBuyer(metal: ReturnType<typeof createMetalClient>) {
-  const saved = new Map<string, { txHash: string; idempotencyKey: string }>();
-  const store = {
-    find: async (k: string) => saved.get(k),
-    findByHash: async (h: string) => [...saved.values()].find((a) => a.txHash === h),
-    save: async (a: { txHash: string; idempotencyKey: string }) => {
-      saved.set(a.idempotencyKey, a);
-    },
-    recordFee: async () => undefined,
-    totalFees: async () => 0n,
-  };
-  const rail = new MetalRail(metal, store as never);
-  const key = generatePrivateKey();
-  const sent = await rail.payout({
-    idempotencyKey: randomUUID(),
-    member: { id: 'buyer', railRefs: { metal_account: privateKeyToAccount(key).address } },
-    currency: 'USD',
-    amount: 150n,
-    reference: 'demo buyer',
-  } as never);
-  await until('the buyer wallet to be funded', async () => {
-    const now = await rail.status(sent.externalRef);
-    if (now.status === 'failed') throw new Error(`Funding the buyer failed: ${now.reason}`);
-    return now.status === 'confirmed' ? true : undefined;
-  });
-  return key;
 }
 
 const beneficiary = (name: string) => ({
@@ -172,7 +136,7 @@ const credentials = {
 const tunnel = await openTunnel();
 process.on('exit', () => tunnel.process.kill());
 const tunnelHost = new URL(tunnel.url).host;
-/** Asking Airwallex before the name is public gets a refusal it may remember, so wait first. */
+// Asking Airwallex before the name is public gets a refusal it may remember, so wait first.
 await until(
   'the tunnel name to be public',
   async () => {
@@ -189,10 +153,10 @@ await until(
     );
     return resolved.every(Boolean) ? true : undefined;
   },
-  120_000,
+  { timeoutMs: 120_000 },
 );
 await sleep(5_000);
-/** Airwallex refuses an address until it resolves publicly, which a new tunnel takes a moment to do. */
+// Airwallex can still call the address internal for a while after it resolves.
 const webhookSecret = await until(
   'Airwallex to accept the tunnel',
   () =>
@@ -202,7 +166,7 @@ const webhookSecret = await until(
         if (!/internal address/.test(err.message)) throw err;
         return undefined;
       }),
-  90_000,
+  { timeoutMs: 90_000 },
 );
 const airwallex = new AirwallexRail({ ...credentials, webhookSecret });
 const rails = new RailRegistry().register(airwallex);
@@ -213,6 +177,7 @@ const model = new ClaudeModelClient();
 const engine = await launchEngine({
   databaseUrl: databaseUrl(APP_DB),
   systemDatabaseUrl: databaseUrl(SYSTEM_DB),
+  auth: authFromEnv(PORT),
   appName: 'novate-demo',
   rails,
   ownedRails: rails.all().map((r) => r.name),
@@ -224,8 +189,9 @@ const app = createApp({
   x402: metal ? metalGateway(metal.houseAddress, metal.reader) : undefined,
 });
 const server = serve({
-  fetch: async (req: Request) => {
-    const res = await app.fetch(req);
+  // The node server's bindings carry the socket, which sign-in rate limits key on.
+  fetch: async (req: Request, env: unknown) => {
+    const res = await app.fetch(req, env);
     if (new URL(req.url).pathname.startsWith('/rails/') && !res.ok) {
       console.warn(`Refused a webhook: ${res.status} ${await res.clone().text()}`);
     }
@@ -239,14 +205,18 @@ await until(
     const res = await fetch(`${tunnel.url}/health`).catch(() => undefined);
     return res?.ok ? true : undefined;
   },
-  60_000,
+  { timeoutMs: 60_000 },
 );
 
 const first = engine.firstRun as NonNullable<typeof engine.firstRun>;
 const tenant = first.tenantId;
-const { key: houseKey } = await createHouseKey(tenant);
 const platform = first.platformKey;
-const consoleUrl = `http://localhost:${PORT}/console#key=${houseKey}`;
+// Sign-in accounts with known passwords, made only because this is the local demo database.
+let demoUsers = await ensureDemoUsers(databaseUrl(APP_DB));
+const consoleUrl = `http://localhost:${PORT}/console/`;
+const signIns = () => {
+  for (const u of demoUsers) say(`  ${u.role.padEnd(8)} ${u.email}  password ${u.password}`);
+};
 
 async function api<T>(key: string, method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`http://localhost:${PORT}${path}`, {
@@ -259,6 +229,49 @@ async function api<T>(key: string, method: string, path: string, body?: unknown)
   return JSON.parse(text) as T;
 }
 const base = `/tenants/${tenant}`;
+
+/** One of the demo's house people, signed in through the console's own login, acting with that session. */
+async function signedIn(email: string) {
+  const origin = `http://localhost:${PORT}`;
+  const user = demoUsers.find((u) => u.email === email);
+  if (!user) throw new Error(`No demo user ${email}`);
+  const login = await fetch(`${origin}/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-requested-with': 'novate', origin },
+    body: JSON.stringify({ email, password: user.password }),
+  });
+  if (!login.ok) throw new Error(`${email} could not sign in: ${login.status}`);
+  const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
+  return async <T>(method: string, path: string, body: unknown): Promise<T> => {
+    const res = await fetch(`${origin}${path}`, {
+      method,
+      headers: {
+        cookie,
+        origin,
+        'x-requested-with': 'novate',
+        'content-type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    if (!res.ok) throw new Error(`${method} ${path} answered ${res.status}: ${text.slice(0, 300)}`);
+    return JSON.parse(text) as T;
+  };
+}
+
+/** Where a member is paid: one house person asks and the other approves, as on any installation. */
+async function setPayee(memberId: string, refs: Record<string, string>, reason: string) {
+  const asker = await signedIn('house@demo.local');
+  const asked = await asker<{ status?: string; approvalId?: string }>(
+    'PUT',
+    `${base}/members/${memberId}/rail-refs`,
+    { refs, reason },
+  );
+  if (asked.status === 'pending_approval') {
+    const checker = await signedIn('checker@demo.local');
+    await checker('POST', `${base}/approvals/${asked.approvalId}/approve`, {});
+  }
+}
 
 /** Sandbox transfers wait to be told the bank paid them. */
 const bank = setInterval(async () => {
@@ -307,11 +320,28 @@ async function member(name: string, homeCurrency: string, attributes = {}) {
   ).id;
 }
 
-async function tradingAgent(memberId: string, name: string, currencies: string[]) {
+/** Limits in each deal's currency, in major units. */
+interface Limits {
+  maxPerDeal: string;
+  monthlyLimit: string;
+}
+
+async function tradingAgent(memberId: string, name: string, currencies: string[], limits: Limits) {
   const { id } = await api<{ id: string }>(platform, 'POST', `${base}/agents`, {
     memberId,
     name,
-    mandate: { roles: ['buy', 'sell'], currencies },
+    mandate: {
+      roles: ['buy', 'sell'],
+      limits: Object.fromEntries(
+        currencies.map((c) => [
+          c,
+          {
+            maxPerDeal: fromMajor(limits.maxPerDeal, c).toString(),
+            monthlyLimit: fromMajor(limits.monthlyLimit, c).toString(),
+          },
+        ]),
+      ),
+    },
   });
   const { key } = await api<{ key: string }>(platform, 'POST', `${base}/keys`, {
     name,
@@ -333,17 +363,18 @@ async function openAccounts(memberId: string, slug: string, currency: string, co
     transferMethods: ['LOCAL'],
     beneficiary: beneficiary(`novate demo ${slug}`),
   });
-  await api(houseKey, 'PUT', `${base}/members/${memberId}/rail-refs`, refs);
+  await setPayee(memberId, refs as Record<string, string>, 'Global Account opened for the demo');
   return refs.airwallex_deposit_account as string;
 }
 
 const available = async (memberId: string, currency: string) => {
-  const rows = await api<{ code: string; balance: string }[]>(
+  const rows = await api<{ kind: string; currency: string; balance: string }[]>(
     platform,
     'GET',
     `${base}/members/${memberId}/balances`,
   );
-  return BigInt(rows.find((r) => r.code.endsWith(`:${currency}:available`))?.balance ?? '0');
+  const wallet = rows.find((r) => r.kind === 'available' && r.currency === currency);
+  return BigInt(wallet?.balance ?? '0');
 };
 
 /** Waits for the webhook. A fresh tunnel can be slow to become reachable, so polling backs it up. */
@@ -371,6 +402,7 @@ async function sendMoney(memberId: string, account: string, currency: string, ma
 const instantProgram = (key: string, rail: string) =>
   api(platform, 'POST', `${base}/programs`, {
     key,
+    note: `Demo: settle each ${key} payment on its own as soon as it is released`,
     spec: {
       ...presetInputs.realtimeAgentClearing,
       checks: [],
@@ -456,8 +488,8 @@ interface FeedEntry {
 /** What Claude decided on a case for this deal, and why. */
 async function claudesDecision(deal: string, kind: string) {
   const entry = await until(`Claude to decide the ${kind} case`, async () => {
-    const feed = await api<FeedEntry[]>(platform, 'GET', `${base}/decisions`);
-    return feed.find((d) => d.dealId === deal && d.kind === kind && d.resolution);
+    const feed = await api<{ rows: FeedEntry[] }>(platform, 'GET', `${base}/decisions`);
+    return feed.rows.find((d) => d.dealId === deal && d.kind === kind && d.resolution);
   });
   const trail = await api<{ steps: { rationale: string; action: { type: string } }[] }>(
     platform,
@@ -486,6 +518,7 @@ try {
   const settlement = { netting: 'multilateral', rail: 'airwallex', confirmWithin: '1h' } as const;
   await api(platform, 'POST', `${base}/programs`, {
     key: 'trade',
+    note: 'Demo: trade assurance for mugs, agents decide cases up to €200,000',
     spec: {
       ...presetInputs.tradeAssurance,
       overrides: [],
@@ -495,20 +528,32 @@ try {
   });
   done('Trade assurance published: buyers prefund, money releases on proof of delivery.');
   done('Agents may decide cases up to €200,000. Anything larger goes to a person.');
-  say(`Open the clearing desk: ${paint(36, consoleUrl)}`);
+  say(`Open the clearing desk: ${paint(36, consoleUrl)} and sign in as`);
+  signIns();
   if (!process.argv.includes('--no-open')) spawn('open', [consoleUrl]);
 
   await chapter('Businesses join, each with a real Airwallex account');
   const brandId = await member('Homeware brand', 'GBP', { payout: 'wallet' });
   const supplierId = await member('Portuguese supplier', 'EUR');
   const retailerId = await member('Dutch retailer', 'EUR');
+  demoUsers = await ensureDemoUsers(databaseUrl(APP_DB));
   const brandAccount = await openAccounts(brandId, 'brand', 'GBP', 'GB');
   const supplierAccount = await openAccounts(supplierId, 'supplier', 'EUR', 'DE');
   const retailerAccount = await openAccounts(retailerId, 'retailer', 'EUR', 'DE');
   done('Three members, each with their own Global Account and payout details.');
-  const brand = await tradingAgent(brandId, 'Brand trading agent', ['EUR', 'USD']);
-  const supplier = await tradingAgent(supplierId, 'Supplier trading agent', ['EUR', 'USD']);
-  const retailer = await tradingAgent(retailerId, 'Retailer trading agent', ['EUR', 'USD']);
+  // Each limit leaves room for the €90,000 mistake, so it is the quantity rule that catches it.
+  const brand = await tradingAgent(brandId, 'Brand trading agent', ['EUR', 'USD'], {
+    maxPerDeal: '100000',
+    monthlyLimit: '250000',
+  });
+  const supplier = await tradingAgent(supplierId, 'Supplier trading agent', ['EUR', 'USD'], {
+    maxPerDeal: '50000',
+    monthlyLimit: '150000',
+  });
+  const retailer = await tradingAgent(retailerId, 'Retailer trading agent', ['EUR', 'USD'], {
+    maxPerDeal: '100000',
+    monthlyLimit: '200000',
+  });
   done('Three trading agents connected over MCP, each with its own limits.');
 
   await chapter('Money arrives, and novate credits only what Airwallex confirms');
@@ -650,9 +695,11 @@ try {
     await chapter('A buyer pays in stablecoin instead, on Metal');
     const usd = await member('Research agents co', 'USD');
     const seller = await member('Data vendor', 'USD');
-    await api(houseKey, 'PUT', `${base}/members/${seller}/rail-refs`, {
-      metal_account: privateKeyToAccount(generatePrivateKey()).address,
-    });
+    await setPayee(
+      seller,
+      { metal_account: privateKeyToAccount(generatePrivateKey()).address },
+      'Seller wallet for the demo',
+    );
     await instantProgram('instant', 'metal');
     const { id: deal } = await api<{ id: string }>(platform, 'POST', `${base}/deals`, {
       idempotencyKey: randomUUID(),
@@ -696,6 +743,7 @@ try {
   await chapter('Switch programs, same agents, no prefunding');
   await api(platform, 'POST', `${base}/programs`, {
     key: 'net',
+    note: 'Demo: the same agents switch to net settlement with no prefunding',
     spec: {
       ...presetInputs.netSettlement,
       overrides: [],
@@ -740,7 +788,8 @@ try {
   done('The books still match Airwallex.');
 
   console.log(`\n${paint(1, 'No person touched a transaction.')}`);
-  say(`Clearing desk: ${paint(36, consoleUrl)}`);
+  say(`Clearing desk: ${paint(36, consoleUrl)}, signed in as`);
+  signIns();
   say('Still running so the desk stays live. Press Ctrl-C to finish.');
 } catch (err) {
   console.error(paint(31, `\nThe demo stopped: ${(err as Error).message}`));

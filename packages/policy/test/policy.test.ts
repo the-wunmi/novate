@@ -4,6 +4,7 @@ import {
   deepMerge,
   evaluateCondition,
   type Fact,
+  findingsReason,
   ProgramSpec,
   presets,
   type RuleContext,
@@ -95,7 +96,7 @@ describe('resolvePolicy', () => {
       }),
     );
     expect(r.marginBps).toBe(1_000);
-    expect(r.marginTrace).toContain('+500bps seller has missed deliveries');
+    expect(r.marginTrace).toContain('+500bps the seller has missed deliveries');
   });
 
   it('rejects overrides that would produce an invalid policy', () => {
@@ -189,6 +190,44 @@ describe('release conditions (mug scenario)', () => {
     expect(evaluateCondition(condition, base(facts)).state).toBe('satisfied');
   });
 
+  it('says what is wrong in words a person reads', () => {
+    const facts = [
+      fact('document', 'commercial_invoice', {
+        fields: { amount: 1_620_000, currency: 'USD', quantity: 800 },
+      }),
+      fact('document', 'packing_list', { fields: { quantity: 1_000 } }),
+      fact('document', 'bill_of_lading', { fields: { shipmentDate: '2026-11-06' } }),
+      fact('inspection', 'third_party', { passRate: 0.41 }),
+    ];
+    const condition = {
+      all: [
+        {
+          type: 'documents',
+          require: ['commercial_invoice', 'packing_list', 'bill_of_lading'],
+          match: {
+            shipmentDateLateDays: 3,
+            requireFields: { packing_list: ['quantity', 'grossWeight'] },
+          },
+        },
+        { type: 'inspection', minPassRate: 0.8 },
+      ],
+    };
+    const found = evaluateCondition(condition as never, base(facts)).findings;
+    expect(Object.fromEntries(found.map((f) => [f.code, f.message]))).toEqual({
+      'commercial_invoice.quantity_mismatch':
+        'The commercial invoice quantity is 800, but the deal agreed 1000',
+      'commercial_invoice.amount_mismatch':
+        'The commercial invoice amount is 16200.00 EUR, but the deal agreed 14000.00 EUR',
+      'commercial_invoice.currency_mismatch':
+        'The commercial invoice is in USD, but the deal is in EUR',
+      'packing_list.unreadable': 'The packing list has no gross weight',
+      'bill_of_lading.shipment_late':
+        'The bill of lading shows shipment 4 days after the agreed date, more than the 3 days allowed',
+      'inspection.below_threshold':
+        'The inspection passed 41.0% of the goods, below the 80.0% required',
+    });
+  });
+
   it('blocks when too many units fail inspection', () => {
     const facts = [...docs('2026-11-02'), fact('inspection', 'third_party', { passRate: 0.6 })];
     expect(evaluateCondition(condition, base(facts)).state).toBe('blocked');
@@ -201,5 +240,17 @@ describe('release conditions (mug scenario)', () => {
     expect(evaluateCondition(c, { ...base([]), now: new Date('2026-11-12T00:00:00Z') }).state).toBe(
       'satisfied',
     );
+  });
+});
+
+describe('findings as a reason', () => {
+  it('says each finding once, in sentences, with no doubled full stop', () => {
+    expect(
+      findingsReason([
+        { message: 'The bill of lading has no shipment date' },
+        { message: 'The bill of lading has no signature.' },
+        { message: 'the bill of lading has no shipment date.' },
+      ]),
+    ).toBe('The bill of lading has no shipment date. The bill of lading has no signature');
   });
 });

@@ -1,12 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { access, writeFile } from 'node:fs/promises';
 import { runMigrations } from '@novate/db/migrate';
+import { testPoolSize } from '@novate/db/test-databases';
 import { launchEngine } from '@novate/engine';
 import { presetInputs } from '@novate/policy';
 import { MockRail, RailRegistry } from '@novate/rails';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { payWithAiri, readCredential } from '../src/airi-buyer.ts';
 import { createApp } from '../src/app.ts';
+import { testEngine } from './people.ts';
 
 const ADMIN = 'card-admin';
 const CARD = '4111111111111111';
@@ -14,9 +16,11 @@ const app = createApp({ isOperator: async (key) => key === ADMIN });
 let engine: Awaited<ReturnType<typeof launchEngine>>;
 
 beforeAll(async () => {
-  process.loadEnvFile(new URL('../../../.env', import.meta.url).pathname);
   await runMigrations();
   engine = await launchEngine({
+    ...testEngine(),
+    pace: 0.01,
+    poolSize: testPoolSize,
     appName: `novate-card-${Date.now()}`,
     rails: new RailRegistry().register(new MockRail()),
   });
@@ -32,7 +36,7 @@ const call = (path: string, key: string, body?: unknown) =>
 
 async function fundingDeal() {
   const { tenant, apiKey } = (await (
-    await call('/tenants', ADMIN, { name: `c-${randomUUID()}` })
+    await call('/operator/tenants', ADMIN, { name: `c-${randomUUID()}` })
   ).json()) as { tenant: { id: string }; apiKey: string };
   const member = async (name: string) =>
     (

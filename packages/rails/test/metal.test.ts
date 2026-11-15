@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { MetalRail } from '../src/index.ts';
-import { FakeMetal, MemoryAttempts } from './fake-metal.ts';
+import { MemoryMetalAttempts, MetalRail } from '../src/index.ts';
+import { FakeMetal } from './fake-metal.ts';
 
 const CENT = 10n ** 16n;
 const make = () => {
   const chain = new FakeMetal();
-  const store = new MemoryAttempts();
+  const store = new MemoryMetalAttempts();
   return { chain, store, rail: new MetalRail(chain, store) };
 };
 const req = {

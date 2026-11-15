@@ -21,7 +21,7 @@ export interface Position {
   net: bigint;
   /** Funds already held for this member's payables in this cycle. */
   prefunded: bigint;
-  /** What must be collected from the member (> 0) or paid out to it (< 0 is never produced). */
+  /** What the member must pay in. Never negative: money owed to it is `payout`. */
   collect: bigint;
   payout: bigint;
 }

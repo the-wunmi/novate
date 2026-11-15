@@ -7,9 +7,10 @@ export type Db = NodePgDatabase<Schema>;
 /** A db handle or an open transaction — repositories accept either. */
 export type Tx = Db | Parameters<Parameters<Db['transaction']>[0]>[0];
 
-export function createPool(url = process.env.DATABASE_URL): pg.Pool {
+/** `max` is the most connections the pool opens at once. */
+export function createPool(url = process.env.DATABASE_URL, max = 10): pg.Pool {
   if (!url) throw new Error('DATABASE_URL is not set');
-  return new pg.Pool({ connectionString: url, max: 10 });
+  return new pg.Pool({ connectionString: url, max });
 }
 
 export function createDb(pool: pg.Pool): Db {

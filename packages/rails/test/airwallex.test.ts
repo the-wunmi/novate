@@ -433,6 +433,31 @@ describe('opening a connected account after a failure part way', () => {
   });
 });
 
+describe('opening a Global Account past the sandbox cap', () => {
+  it('says which currency and country Airwallex refused', async () => {
+    const fake = new FakeAirwallex();
+    const rail = new AirwallexRail({ clientId: 'c', apiKey: 'k', fetch: fake.fetch });
+    await rail.balances();
+    fake.failNext = {
+      status: 400,
+      body: { code: 'NO_MORE_VBA_ALLOWED', message: 'no more GA is allowed for currencies: [EUR]' },
+    };
+    await expect(
+      rail.provision({
+        requestId: 'member-1',
+        countryCode: 'DE',
+        currency: 'EUR',
+        nickName: 'Seller',
+        transferMethods: ['LOCAL'],
+        beneficiary: { entity_type: 'COMPANY' },
+      }),
+    ).rejects.toMatchObject({
+      code: 'rail_refused',
+      message: 'Airwallex will not open more EUR accounts in DE on this account',
+    });
+  });
+});
+
 describe('setting up a pooled member after the payee was refused', () => {
   const input = {
     requestId: 'member-1',

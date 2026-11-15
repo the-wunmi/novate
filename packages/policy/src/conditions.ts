@@ -1,4 +1,4 @@
-import { applyBps, maxBig, minBig } from '@novate/core';
+import { applyBps, maxBig, minBig, toMajor } from '@novate/core';
 import { z } from 'zod';
 import { evalCelBool, evalCelInt } from './cel.ts';
 import { customConditions } from './condition-registry.ts';
@@ -41,6 +41,19 @@ export interface Finding {
   waivable: boolean;
 }
 
+/**
+ * Findings as one reason. Rules write messages without a full stop and a document reader may add
+ * one, and two documents can report the same thing, so each is said once, in sentences.
+ */
+export function findingsReason(findings: Pick<Finding, 'message'>[]): string {
+  const said = new Map<string, string>();
+  for (const f of findings) {
+    const message = f.message.trim().replace(/[.\s]+$/, '');
+    if (message && !said.has(message.toLowerCase())) said.set(message.toLowerCase(), message);
+  }
+  return [...said.values()].join('. ');
+}
+
 export type ConditionState = 'satisfied' | 'pending' | 'blocked';
 
 export interface ConditionResult {
@@ -75,6 +88,20 @@ function waived(ctx: ConditionContext, finding: Finding): boolean {
   );
 }
 
+/** `bill_of_lading` reads as "bill of lading", `shipmentDate` as "shipment date". */
+const words = (name: string) =>
+  name
+    .replaceAll('_', ' ')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .toLowerCase();
+
+const either = (items: string[]) =>
+  items.length > 1 ? `${items.slice(0, -1).join(', ')} or ${items.at(-1)}` : (items[0] ?? '');
+
+const major = (amount: bigint, currency: string) => `${toMajor(amount, currency)} ${currency}`;
+
+const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
 function daysBetween(a: string, b: string): number {
   return Math.round((Date.parse(b) - Date.parse(a)) / 86_400_000);
 }
@@ -90,6 +117,7 @@ const builtins: Record<string, ConditionEvaluator> = {
     for (const type of n.require) {
       const doc = latest(factsOf(ctx, 'document', type)) as Fact;
       const fields = (doc.data.fields ?? {}) as Record<string, unknown>;
+      const the = `The ${words(type)}`;
 
       // Evidence nobody could read is a finding. It must never pass as a match.
       const needed = match.requireFields[type] ?? [];
@@ -98,8 +126,8 @@ const builtins: Record<string, ConditionEvaluator> = {
         findings.push({
           code: `${type}.unreadable`,
           message: absent.length
-            ? `${type} is missing ${absent.join(', ')}`
-            : `${type} has no readable fields`,
+            ? `${the} has no ${either(absent.map(words))}`
+            : `${the} could not be read`,
           factId: doc.id,
           waivable: true,
         });
@@ -110,7 +138,7 @@ const builtins: Record<string, ConditionEvaluator> = {
         if (late > match.shipmentDateLateDays) {
           findings.push({
             code: `${type}.shipment_late`,
-            message: `${type} shipment date is ${late} day(s) after the agreed date (tolerance ${match.shipmentDateLateDays})`,
+            message: `${the} shows shipment ${plural(late, 'day')} after the agreed date, more than the ${plural(match.shipmentDateLateDays, 'day')} allowed`,
             factId: doc.id,
             waivable: true,
           });
@@ -121,7 +149,7 @@ const builtins: Record<string, ConditionEvaluator> = {
         if (diffPct > match.quantityTolerancePct) {
           findings.push({
             code: `${type}.quantity_mismatch`,
-            message: `${type} quantity ${fields.quantity} vs agreed ${ctx.deal.quantity}`,
+            message: `${the} quantity is ${fields.quantity}, but the deal agreed ${ctx.deal.quantity}`,
             factId: doc.id,
             waivable: true,
           });
@@ -131,7 +159,7 @@ const builtins: Record<string, ConditionEvaluator> = {
       if (fields.amount !== undefined && amt === undefined) {
         findings.push({
           code: `${type}.amount_invalid`,
-          message: `${type} amount is not a whole number of minor units`,
+          message: `${the} amount is not a valid amount`,
           factId: doc.id,
           waivable: false,
         });
@@ -141,7 +169,7 @@ const builtins: Record<string, ConditionEvaluator> = {
         if (Number(diff * 10_000n) / Number(ctx.deal.amount) / 100 > match.amountTolerancePct) {
           findings.push({
             code: `${type}.amount_mismatch`,
-            message: `${type} amount ${amt} vs agreed ${ctx.deal.amount}`,
+            message: `${the} amount is ${major(amt, ctx.deal.currency)}, but the deal agreed ${major(ctx.deal.amount, ctx.deal.currency)}`,
             factId: doc.id,
             waivable: true,
           });
@@ -150,7 +178,7 @@ const builtins: Record<string, ConditionEvaluator> = {
       if (fields.currency !== undefined && fields.currency !== ctx.deal.currency) {
         findings.push({
           code: `${type}.currency_mismatch`,
-          message: `${type} currency ${String(fields.currency)} vs agreed ${ctx.deal.currency}`,
+          message: `${the} is in ${String(fields.currency)}, but the deal is in ${ctx.deal.currency}`,
           factId: doc.id,
           waivable: false,
         });
@@ -180,7 +208,7 @@ const builtins: Record<string, ConditionEvaluator> = {
     if (rate < min) {
       const finding: Finding = {
         code: 'inspection.below_threshold',
-        message: `inspection pass rate ${(rate * 100).toFixed(1)}% below ${(min * 100).toFixed(1)}%`,
+        message: `The inspection passed ${(rate * 100).toFixed(1)}% of the goods, below the ${(min * 100).toFixed(1)}% required`,
         factId: fact.id,
         waivable: true,
       };
@@ -211,7 +239,7 @@ const builtins: Record<string, ConditionEvaluator> = {
       state: 'blocked',
       findings: open.map((d) => ({
         code: 'dispute.open',
-        message: String(d.data.reason ?? 'dispute raised'),
+        message: String(d.data.reason ?? 'A party raised a dispute'),
         factId: d.id,
         waivable: false,
       })),
@@ -283,7 +311,11 @@ export function evaluateCondition(node: ConditionNode, ctx: ConditionContext): C
     return {
       state: 'blocked',
       findings: [
-        { code: 'condition.unknown', message: `Unknown condition ${type}`, waivable: false },
+        {
+          code: 'condition.unknown',
+          message: `The program uses a condition this house does not know: ${type}`,
+          waivable: false,
+        },
       ],
       trace: [`unknown condition ${type}`],
     };
@@ -299,6 +331,36 @@ function combine(results: ConditionResult[], state: ConditionState): ConditionRe
     findings: results.flatMap((r) => r.findings),
     trace: results.flatMap((r) => r.trace),
   };
+}
+
+/** The conditions a tree is built from, without the all, any and not around them. */
+function leaves(node: ConditionNode): ConditionNode[] {
+  if ('all' in node && Array.isArray(node.all))
+    return (node.all as ConditionNode[]).flatMap(leaves);
+  if ('any' in node && Array.isArray(node.any))
+    return (node.any as ConditionNode[]).flatMap(leaves);
+  if ('not' in node) return leaves(node.not as ConditionNode);
+  return [node];
+}
+
+/** What release waits on, as a party would name it: the documents, the buyer's word, or neither. */
+export function releaseWaitsFor(node: ConditionNode): 'documents' | 'acceptance' | 'conditions' {
+  const types = new Set(leaves(node).map((n) => (n as { type: string }).type));
+  return types.has('documents')
+    ? 'documents'
+    : types.has('acceptance')
+      ? 'acceptance'
+      : 'conditions';
+}
+
+/** How many days late a shipment may be before the documents check finds it; null when none runs. */
+export function shipmentTolerance(node: ConditionNode): number | null {
+  const days = leaves(node).flatMap((n) =>
+    (n as { type: string }).type === 'documents'
+      ? [DocumentMatch.parse((n as { match?: unknown }).match ?? {}).shipmentDateLateDays]
+      : [],
+  );
+  return days.length ? Math.min(...days) : null;
 }
 
 export function passRate(fact: Fact): number {

@@ -18,9 +18,9 @@ let tenantId: string;
 const ledger = new PostgresLedger();
 const house = Accounts.houseCash('mock', 'EUR');
 const wallet = (m: string) => Accounts.memberAvailable(m, 'EUR');
+const feeSink = randomUUID();
 
 beforeAll(async () => {
-  process.loadEnvFile(new URL('../../../.env', import.meta.url).pathname);
   await runMigrations();
   pool = createPool(process.env.DATABASE_URL as string);
   db = createDb(pool) as unknown as Tx;
@@ -68,7 +68,7 @@ describe('ledger', () => {
         {
           key: randomUUID(),
           debit: wallet(m),
-          credit: Accounts.memberAvailable('fees', 'EUR'),
+          credit: Accounts.memberAvailable(feeSink, 'EUR'),
           amount: 200n,
           kind: 'x',
         },
@@ -82,7 +82,7 @@ describe('ledger', () => {
         {
           key: randomUUID(),
           debit: house,
-          credit: Accounts.memberAvailable('m', 'GBP'),
+          credit: Accounts.memberAvailable(randomUUID(), 'GBP'),
           amount: 1n,
           kind: 'x',
         },
@@ -99,7 +99,7 @@ describe('ledger', () => {
             {
               key: randomUUID(),
               debit: wallet(m),
-              credit: Accounts.memberAvailable('fees', 'EUR'),
+              credit: Accounts.memberAvailable(feeSink, 'EUR'),
               amount: 40n,
               kind: 'x',
             },
@@ -119,6 +119,35 @@ describe('ledger', () => {
       .from(ledgerAccounts)
       .where(eq(ledgerAccounts.tenantId, tenantId));
     expect(row?.d).toBe(row?.c);
+  });
+  it('finds accounts by kind and owner', async () => {
+    const m = randomUUID();
+    const deal = randomUUID();
+    await fund(m, 300n);
+    await ledger.post(db, tenantId, [
+      {
+        key: randomUUID(),
+        debit: wallet(m),
+        credit: Accounts.dealEscrow(deal, 'EUR'),
+        amount: 100n,
+        kind: 'escrow_lock',
+      },
+      {
+        key: randomUUID(),
+        debit: Accounts.memberDebt(m, 'EUR'),
+        credit: Accounts.memberAvailable(m, 'EUR'),
+        amount: 1n,
+        kind: 'x',
+      },
+    ]);
+    const mine = await ledger.balances(db, tenantId, { memberId: m });
+    expect(mine.map((b) => [b.kind, b.balance]).sort()).toEqual([
+      ['available', 201n],
+      ['debt', -1n],
+    ]);
+    expect(await ledger.balances(db, tenantId, { memberId: m, positive: true })).toHaveLength(1);
+    const [escrow] = await ledger.balances(db, tenantId, { dealIds: [deal], kinds: ['escrow'] });
+    expect(escrow).toMatchObject({ dealId: deal, memberId: null, balance: 100n });
   });
   it('cannot be rewritten', async () => {
     await expect(

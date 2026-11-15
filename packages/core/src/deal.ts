@@ -9,7 +9,6 @@ export const DealLine = z.object({
 });
 export type DealLine = z.infer<typeof DealLine>;
 
-/** What two agents agreed. Free-form `attributes` lets platforms carry their own terms. */
 export const DealShape = z.enum(['goods', 'service', 'payment']);
 export type DealShape = z.infer<typeof DealShape>;
 
@@ -26,6 +25,7 @@ export const DealLeg = z.object({
 });
 export type DealLeg = z.infer<typeof DealLeg>;
 
+/** What two agents agreed. Free-form `attributes` lets platforms carry their own terms. */
 export const DealTerms = z
   .object({
     shape: DealShape.default('goods'),
@@ -40,6 +40,8 @@ export const DealTerms = z
   })
   .refine((t) => dealAmount(t) <= MAX_MINOR, { message: 'Deal is too large' });
 export type DealTerms = z.infer<typeof DealTerms>;
+/** Terms as stored: amounts as strings and defaults unfilled until parsed. */
+export type StoredDealTerms = z.input<typeof DealTerms>;
 
 export function dealAmount(terms: { lines: { quantity: number; unitPrice: bigint }[] }): bigint {
   return terms.lines.reduce((acc, l) => acc + l.unitPrice * BigInt(l.quantity), 0n);
@@ -75,16 +77,38 @@ export type DocumentContent =
   | { kind: 'image'; mediaType: 'image/png' | 'image/jpeg' | 'image/webp'; base64: string }
   | { kind: 'text'; text: string };
 
-/**
- * An agent's spending/selling authority, granted by the member that owns it. Limits are in minor
- * units and apply separately in each currency the mandate allows.
- */
-export const Mandate = z.object({
-  roles: z.array(z.enum(['buy', 'sell'])).min(1),
-  currencies: z.array(Currency).min(1),
-  categories: z.array(z.string()).optional(),
-  counterparties: z.array(z.string()).optional(),
+/** Limits in one currency's minor units. */
+export const CurrencyLimits = z.object({
   maxPerDeal: MinorAmount.optional(),
   monthlyLimit: MinorAmount.optional(),
 });
+export type CurrencyLimits = z.infer<typeof CurrencyLimits>;
+
+/**
+ * An agent's spending/selling authority, granted by the member that owns it. `limits` names the
+ * currencies the agent may deal in, each with its limits in that currency's minor units; a deal in
+ * any other currency is refused.
+ */
+export const Mandate = z.object({
+  roles: z.array(z.enum(['buy', 'sell'])).min(1),
+  limits: z
+    .record(Currency, CurrencyLimits)
+    .refine((l) => Object.keys(l).length > 0, 'Name at least one currency'),
+  categories: z.array(z.string()).optional(),
+  counterparties: z.array(z.string()).optional(),
+});
+
+/** The limits that apply to a deal in `currency`, or null when the mandate does not allow it. */
+export function mandateLimits(m: Mandate, currency: Currency): CurrencyLimits | null {
+  return m.limits[currency] ?? null;
+}
 export type Mandate = z.infer<typeof Mandate>;
+/** A mandate as stored: amounts as strings until parsed. */
+export type StoredMandate = z.input<typeof Mandate>;
+
+/** What a fact records. A document's reading puts what it says in `fields` and its problems in `issues`. */
+export interface FactData {
+  fields?: Record<string, unknown>;
+  issues?: { code: string; message: string }[];
+  [key: string]: unknown;
+}

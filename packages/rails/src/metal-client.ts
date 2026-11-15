@@ -48,12 +48,12 @@ export interface MetalClientConfig {
   transport?: Transport;
 }
 
-/** Talks to Metal through viem and Metal's SDK. Signing is local; the RPC never sees the key. */
 /** Whether a receipt's logs hold any of these events. For callers with an ABI but no viem. */
 export function hasEvent(logs: Log[], abi: Abi, eventName: string[]): boolean {
   return parseEventLogs({ abi, logs, eventName: eventName as never }).length > 0;
 }
 
+/** Talks to Metal through viem and Metal's SDK. Signing is local; the RPC never sees the key. */
 export function createMetalClient(config: MetalClientConfig): MetalClient {
   const transport = config.transport ?? http(config.rpcUrl);
   const account = privateKeyToAccount(config.privateKey);

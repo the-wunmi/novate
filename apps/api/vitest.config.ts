@@ -1,11 +1,17 @@
-import { freshTestDatabases } from '@novate/db/test-databases';
-import { defineConfig } from 'vitest/config';
+import { freshTestDatabases, testWorkers } from '@novate/db/test-databases';
+import { configDefaults, defineConfig } from 'vitest/config';
+
+// Each worker gets its own databases, so files run in parallel.
+const workers = testWorkers.api;
 
 export default defineConfig(async () => ({
   test: {
-    fileParallelism: false,
+    // Live tests reach real rails and models and drive a dev server. Only `pnpm test:live` runs them.
+    exclude: [...configDefaults.exclude, '**/*.live.test.ts'],
+    maxWorkers: workers,
+    setupFiles: ['@novate/db/test-worker'],
     testTimeout: 30_000,
     hookTimeout: 60_000,
-    env: await freshTestDatabases('api'),
+    env: await freshTestDatabases('api', workers),
   },
 }));

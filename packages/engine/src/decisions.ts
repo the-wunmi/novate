@@ -1,5 +1,8 @@
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import {
+  type CaseDecision,
+  type ControlActor,
+  type Decider,
   DomainError,
   dealAmount,
   describePrincipal,
@@ -7,16 +10,20 @@ import {
   type Principal,
   parseInput,
   sha256,
+  toJson,
 } from '@novate/core';
 import { dealFacts, decisionCases, decisionRecords, type Tx } from '@novate/db';
 import {
   Action,
+  type ActionCheck,
   type ActionContext,
-  ALLOWED_ACTIONS,
+  allowedActions,
   type CaseKind,
   type CaseView,
+  type Claimant,
+  ceilingIn,
+  checkAction,
   type DeciderKind,
-  type DeciderType,
   type DecisionAgent,
   type Decisions,
   durationMs,
@@ -24,15 +31,22 @@ import {
   firstAccepted,
   type OpenFinding,
   type Proposal,
+  refusalsOf,
   type UntrustedProposal,
-  validateAction,
   withinCeiling,
 } from '@novate/policy';
 import { asc, count, eq } from 'drizzle-orm';
 import { z } from 'zod';
-import { deps, isWorkflowControl, tx } from './deps.ts';
+import { actorOf, personOf } from './control.ts';
+import { deps, isWorkflowControl, paced, tx } from './deps.ts';
+import {
+  APPROVAL_TTL_MS,
+  type PendingApproval,
+  registerApprovalExecutor,
+  requestApproval,
+} from './four-eyes.ts';
 import { notify } from './notifications.ts';
-import { type DealRow, getDeal } from './repo.ts';
+import { type DealRow, decidedAction, getDeal, inTenant } from './repo.ts';
 import { Topics } from './topics.ts';
 import { modelCeilingFor } from './track-record.ts';
 
@@ -59,11 +73,10 @@ export interface CaseSpec {
   ruleVars?: Record<string, unknown>;
   /** Cases that must not block the workflow on a person (cycles, monitors). */
   skipPerson?: boolean;
-}
-
-export interface Decider {
-  type: DeciderType;
-  id: string;
+  /** The workflow waiting on this case, where that is not the deal's own, such as a claim. */
+  workflowId?: string;
+  /** On a claim after settlement: who filed it, which decides the remedy a decider may grant. */
+  claimant?: Claimant;
 }
 
 export type CaseResolution =
@@ -85,16 +98,21 @@ interface StoredContext {
   marginPosted?: string;
   marginFloorBps?: number;
   /** What a model may decide up to, which may be less than the tenant's ceiling. */
-  modelCeiling?: Record<string, number>;
+  modelCeiling: Record<string, number>;
   planIds?: string[];
   memberIds?: string[];
   agentIds?: string[];
   attemptsLeft?: number;
   evidence: Record<string, unknown>;
   subject: { type: string; id: string };
+  workflowId?: string;
+  claimant?: Claimant;
 }
 
 const contextOf = (row: CaseRow) => row.context as unknown as StoredContext;
+
+/** A case as read models show it, with the context it was opened with. */
+export const caseView = (row: CaseRow) => ({ ...row, context: contextOf(row) });
 
 /** Large enough for any real document's fields, small enough that a party cannot run up the bill. */
 const MAX_SHOWN_FACT_CHARS = 20_000;
@@ -172,6 +190,8 @@ async function openCase(
     attemptsLeft: spec.attemptsLeft,
     evidence: spec.evidence,
     subject: { type: spec.subjectType, id: spec.subjectId },
+    workflowId: spec.workflowId,
+    claimant: spec.claimant,
   } as unknown as StoredContext;
   const shown = await buildShown(db, { ...spec, dealId: spec.dealId ?? null }, context);
   const [row] = await db
@@ -186,10 +206,17 @@ async function openCase(
       bindingHash: sha256(shown),
       shown,
       context: context as unknown as Record<string, unknown>,
+      // Hashed as stored, so the trail can show the limits the gate used have not moved.
+      contextHash: sha256(JSON.parse(toJson(context))),
     })
     .returning();
   return row as CaseRow;
 }
+
+/** Who made a recorded proposal, as the gate judges it: the house acting on its own is a rule. */
+export const recordedDecider = (
+  r: Pick<typeof decisionRecords.$inferSelect, 'deciderType' | 'deciderId'>,
+): Decider => ({ type: r.deciderType === 'system' ? 'rule' : r.deciderType, id: r.deciderId });
 
 /** The facts an action is judged against. A replay can pass different limits to test them. */
 export function actionContext(
@@ -200,13 +227,12 @@ export function actionContext(
 ): ActionContext {
   const c = contextOf(row);
   const decisions = candidate ?? c.decisions;
-  const earned = decider.type === 'model' && !candidate ? c.modelCeiling : undefined;
   return {
     kind: row.kind as CaseKind,
     decider: decider.type,
     amount: BigInt(c.amount),
     currency: c.currency,
-    ceiling: earned ?? decisions.ceiling,
+    ceiling: decider.type === 'model' && !candidate ? c.modelCeiling : decisions.ceiling,
     limits: decisions.limits,
     findings: c.findings,
     marginPosted: c.marginPosted === undefined ? undefined : BigInt(c.marginPosted),
@@ -216,6 +242,7 @@ export function actionContext(
     memberIds: c.memberIds,
     agentIds: c.agentIds,
     attemptsLeft: c.attemptsLeft,
+    claimant: c.claimant,
   };
 }
 
@@ -243,20 +270,22 @@ async function applyProposal(
   proposal: Proposal,
 ): Promise<ApplyResult> {
   const stale = sha256(await buildShown(db, row, contextOf(row))) !== row.bindingHash;
-  const violations = stale
-    ? ['the evidence has changed since this was shown']
-    : validateAction(actionContext(row, decider, proposal.action), proposal.action);
+  const checks: ActionCheck[] = [
+    { code: 'evidence_unchanged', passed: !stale },
+    ...(stale ? [] : checkAction(actionContext(row, decider, proposal.action), proposal.action)),
+  ];
+  const violations = refusalsOf(checks);
   const accepted = violations.length === 0;
 
   await db.insert(decisionRecords).values({
     caseId: row.id,
     deciderType: decider.type,
     deciderId: decider.id,
-    action: proposal.action as Record<string, unknown>,
+    action: proposal.action,
     rationale: proposal.rationale,
     bindingHash: row.bindingHash,
     accepted: accepted ? 1 : 0,
-    violations,
+    checks,
     metadata: proposal.metadata ?? {},
   });
 
@@ -271,7 +300,7 @@ async function applyProposal(
       .set({
         status: 'decided',
         closedAt: new Date(),
-        resolution: { action: proposal.action, decider } as Record<string, unknown>,
+        resolution: { action: proposal.action, decider },
       })
       .where(eq(decisionCases.id, row.id));
   }
@@ -384,7 +413,7 @@ async function askModel(spec: CaseSpec, row: CaseRow): Promise<CaseResolution | 
     reason: spec.reason,
     bindingHash: row.bindingHash,
     shown: row.shown,
-    allowedActions: ALLOWED_ACTIONS[spec.kind],
+    allowedActions: allowedActions(spec.kind, spec.claimant),
   };
   try {
     return await firstAccepted(
@@ -427,7 +456,12 @@ async function askAgent(
     }
   };
   try {
-    return await DBOS.runStep(ask, { name: 'case_model', retriesAllowed: true, maxAttempts: 3 });
+    return await DBOS.runStep(ask, {
+      name: 'case_model',
+      retriesAllowed: true,
+      maxAttempts: 3,
+      intervalSeconds: paced(1_000) / 1_000,
+    });
   } catch (err) {
     if (isWorkflowControl(err)) throw err;
     return {
@@ -438,8 +472,7 @@ async function askAgent(
 
 /** The agent reports which model really answered, and the record must name that one. */
 function answeredBy(agent: DecisionAgent, proposal: Proposal): Decider {
-  const id = proposal.metadata?.answeredBy;
-  return { type: 'model', id: typeof id === 'string' ? id : agent.name };
+  return { type: 'model', id: proposal.metadata?.model ?? agent.name };
 }
 
 /** The model could not give an answer, and that has been recorded. The next decider takes the case. */
@@ -454,7 +487,7 @@ async function recordModelFailure(db: Tx, row: CaseRow, failure: ModelFailure) {
     rationale: failure.note,
     bindingHash: row.bindingHash,
     accepted: 0,
-    violations: [],
+    checks: [],
     metadata: { failure: failure.reason },
   });
 }
@@ -521,9 +554,8 @@ const readCase = (caseId: string) =>
   });
 
 function decidedOutcome(row: CaseRow): CaseResolution {
-  const r = row.resolution as { action: unknown; decider: Decider };
-  // Stored as JSON, so parse again to restore amounts to their real types.
-  return { outcome: 'decided', caseId: row.id, action: Action.parse(r.action), decider: r.decider };
+  const decider = (row.resolution as CaseDecision).decider;
+  return { outcome: 'decided', caseId: row.id, action: decidedAction(row), decider };
 }
 
 const notifyPerson = (spec: CaseSpec, row: CaseRow) =>
@@ -563,39 +595,110 @@ const markStale = (db: Tx, row: CaseRow) =>
 export const DecideCase = z.object({
   bindingHash: z.string(),
   action: Action,
-  rationale: z.string().optional(),
+  /** Why, in the person's words. Kept as the permanent record of the decision. */
+  rationale: z.string().trim().min(1, 'A rationale is required').max(2_000),
 });
 
-/** A person's decision. Same gate as agents, but people may exceed the automated limits. */
+/**
+ * A person's decision. Same gate as agents, but people may exceed the automated limits. For the
+ * house and the platform that person must be signed in: a key alone cannot say who decided. A
+ * signed-in person deciding a case larger than the program's ceiling needs a second person's
+ * approval, and the decision is applied only then, exactly once.
+ */
 export async function decideCase(
   caseId: string,
   principal: Principal,
   input: z.input<typeof DecideCase>,
-): Promise<void> {
-  const { bindingHash, action, rationale } = parseInput(DecideCase, input);
+): Promise<{ status: 'decided' } | PendingApproval> {
+  const decision = parseInput(DecideCase, input);
+  if (principal.kind === 'house' || principal.kind === 'platform') {
+    personOf(principal, 'decide a case');
+  }
   const out = await tx('decide_case', async (db) => {
-    const row = await lockCase(db, caseId);
-    if (row.tenantId !== principal.tenantId) throw new DomainError('not_found', 'Case not found');
-    if (row.status !== 'open') throw new DomainError('conflict', `Case is ${row.status}`);
-    const parties = row.dealId ? await getDeal(db, row.dealId) : null;
-    if (!mayDecideCase(principal, parties, action.type)) {
-      throw new DomainError('unauthorised_agent', 'Not allowed to take this action on this case');
+    const row = await openCaseFor(db, caseId, principal, decision);
+    const ctx = contextOf(row);
+    const amount = BigInt(ctx.amount);
+    const ceiling = BigInt(ceilingIn(ctx.decisions, ctx.currency));
+    if (principal.userId && amount > ceiling) {
+      return requestApproval(db, row.tenantId, principal, {
+        kind: 'case_decision',
+        payload: { caseId, principal: { ...principal }, ...decision },
+        amount,
+        currency: ctx.currency,
+        reason: decision.rationale,
+      });
     }
-    if (bindingHash !== row.bindingHash) {
-      throw new DomainError('conflict', 'Case no longer matches what was shown');
-    }
-    const result = await applyProposal(
-      db,
-      row,
-      { type: 'person', id: describePrincipal(principal) },
-      { action, rationale: rationale ?? 'decided by a person' },
-    );
-    if (!result.accepted && !result.stale) {
-      throw new DomainError('invalid', result.violations.join('; '));
-    }
-    return { stale: result.stale, workflowId: row.dealId ?? row.subjectId };
+    return applyPersonDecision(db, row, principal, decision);
   });
-  const msg: CaseMessage = { type: 'decided', caseId };
-  await DBOS.send(out.workflowId, msg, Topics.case, `case:${caseId}`);
+  if ('status' in out) return out;
+  await sendDecided(out);
+  return { status: 'decided' };
+}
+
+/** The case, locked, if this principal may still decide it as it was shown. */
+async function openCaseFor(
+  db: Tx,
+  caseId: string,
+  principal: Principal,
+  { bindingHash, action }: z.output<typeof DecideCase>,
+): Promise<CaseRow> {
+  const row = await lockCase(db, caseId);
+  inTenant(row, principal.tenantId, 'Case');
+  if (row.status !== 'open') throw new DomainError('conflict', `Case is ${row.status}`);
+  const parties = row.dealId ? await getDeal(db, row.dealId) : null;
+  if (!mayDecideCase(principal, parties, action.type)) {
+    throw new DomainError('unauthorised_agent', 'Not allowed to take this action on this case');
+  }
+  if (bindingHash !== row.bindingHash) {
+    throw new DomainError('conflict', 'Case no longer matches what was shown');
+  }
+  return row;
+}
+
+async function applyPersonDecision(
+  db: Tx,
+  row: CaseRow,
+  principal: Principal,
+  { action, rationale }: z.output<typeof DecideCase>,
+  approval?: { approvalId: string; approvedBy: ControlActor },
+) {
+  const actor = actorOf(principal);
+  const result = await applyProposal(
+    db,
+    row,
+    { type: 'person', id: describePrincipal(principal), actor },
+    { action, rationale, metadata: { actor, ...approval } },
+  );
+  if (!result.accepted && !result.stale) {
+    throw new DomainError('invalid', result.violations.join('; '));
+  }
+  const waiting = contextOf(row).workflowId ?? row.dealId ?? row.subjectId;
+  return { stale: result.stale, workflowId: waiting, caseId: row.id };
+}
+
+async function sendDecided(out: { stale: boolean; workflowId: string; caseId: string }) {
+  const msg: CaseMessage = { type: 'decided', caseId: out.caseId };
+  await DBOS.send(out.workflowId, msg, Topics.case, `case:${out.caseId}`);
   if (out.stale) throw new DomainError('conflict', 'Case no longer matches what was shown');
 }
+
+registerApprovalExecutor('case_decision', {
+  approvers: ['house', 'platform'],
+  ttlMs: APPROVAL_TTL_MS,
+  async run(db, request, approvedBy) {
+    const { caseId, principal, ...rest } = request.payload as {
+      caseId: string;
+      principal: Principal;
+    };
+    const decision = parseInput(DecideCase, rest);
+    const row = await openCaseFor(db, caseId, principal, decision);
+    const out = await applyPersonDecision(db, row, principal, decision, {
+      approvalId: request.id,
+      approvedBy,
+    });
+    // A stale case is recorded as such and the request is not approved: nothing was applied.
+    if (out.stale) throw new DomainError('conflict', 'Case no longer matches what was shown');
+    return out;
+  },
+  after: sendDecided,
+});

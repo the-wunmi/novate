@@ -2,8 +2,18 @@ import { toMajor } from '@novate/core';
 import { dealEvents } from '@novate/db';
 import { MockRail } from '@novate/rails';
 import { asc, eq } from 'drizzle-orm';
-import { decideCase, type Engine, runCycle } from '../src/index.ts';
-import { boot, brain, eur, gbp, makeWorld, shutdown, waitFor, waitForCase } from './harness.ts';
+import { type Engine, runCycle } from '../src/index.ts';
+import {
+  boot,
+  brain,
+  eur,
+  frozenBigOrder,
+  gbp,
+  makeWorld,
+  personDecides,
+  shutdown,
+  waitFor,
+} from './harness.ts';
 
 /**
  * `pnpm demo`: the mug scenario from start to finish, on the in-memory rail. No money moves and no
@@ -26,7 +36,7 @@ async function timeline(dealId: string) {
 
 try {
   brain.current = undefined;
-  const w = await makeWorld(rail, undefined, { monthlyLimit: eur('20000') });
+  const w = await makeWorld(rail, undefined, { EUR: { monthlyLimit: eur('20000') } });
   await w.fund(w.brand, 'GBP', gbp('15000'));
   await w.fund(w.retailer, 'EUR', eur('9000'));
   await w.fund(w.supplier, 'EUR', eur('1000'));
@@ -64,17 +74,12 @@ try {
   await timeline(buy.id);
 
   say('An agent then orders ten times its usual size, and the deal freezes before money moves.');
-  await w.fund(w.retailer, 'EUR', eur('100000'));
-  await w.fund(w.brand, 'GBP', gbp('50000'));
-  const usual = await w.deal({ buyer: 'retailer', seller: 'brand', quantity: 600, price: '15' });
-  await waitFor(usual.id, ['awaiting_conditions']);
-  const big = await w.deal({ buyer: 'retailer', seller: 'brand', quantity: 6_000, price: '15' });
-  await waitFor(big.id, ['frozen']);
-  const open = await waitForCase(w.tenantId, big.id);
+  const { big, case: open } = await frozenBigOrder(w);
   console.log(`  Frozen: ${open.reason}`);
-  // With a model configured the risk agent takes this case. Here the operator does.
-  await decideCase(open.id, w.platform, {
+  // With a model configured the risk agent takes this case. Here a person does.
+  await personDecides(w, open.id, {
     bindingHash: open.bindingHash,
+    rationale: 'Checked against the evidence',
     action: { type: 'cancel' },
   });
   await waitFor(big.id, ['cancelled']);

@@ -65,7 +65,7 @@ export const AGENT_TOOLS: AgentTool[] = [
   }),
   tool({
     name: 'get_balances',
-    description: 'Balances for your member. Platform keys must name the member.',
+    description: 'Balances for your member. Platform and house keys must name the member.',
     input: z.object({ memberId: z.string().uuid().optional() }),
     run: async (principal, { memberId }) =>
       engine.balances(principal.tenantId, memberOf(principal, memberId)),

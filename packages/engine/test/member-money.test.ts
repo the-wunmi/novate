@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { DBOS } from '@dbos-inc/dbos-sdk';
+import { DomainError } from '@novate/core';
 import { deals, marginCalls, members, tenants } from '@novate/db';
 import { type ProgramSpecInput, presetInputs } from '@novate/policy';
 import { MockRail } from '@novate/rails';
@@ -16,22 +17,25 @@ import {
   notify,
   provisionMember,
   requestWithdrawal,
-  runReconciliation,
   setAgentStatus,
-  setMemberRailRefs,
   stopSettlement,
   suspendMember,
   unattributedDepositsOf,
   withdrawalDetail,
 } from '../src/index.ts';
+import { record } from '../src/repo.ts';
 import {
+  assignRailRefs,
   boot,
   brain,
   eur,
   gbp,
   makeWorld,
+  netProgram,
   notified,
   notifierOutage,
+  reconcile,
+  sent,
   shutdown,
   waitFor,
 } from './harness.ts';
@@ -47,11 +51,7 @@ beforeAll(async () => {
 afterAll(() => shutdown());
 
 type World = Awaited<ReturnType<typeof makeWorld>>;
-const net: ProgramSpecInput = {
-  ...presetInputs.netSettlement,
-  overrides: [],
-  settlement: { rail: 'mock' },
-};
+const net = netProgram();
 const ccp: ProgramSpecInput = {
   ...presetInputs.centralCounterparty,
   signals: ['history'],
@@ -64,12 +64,14 @@ const withdraw = (
   onRail = 'mock',
   key = randomUUID(),
 ) =>
-  requestWithdrawal(w.tenantId, memberId, {
-    currency: 'EUR',
-    amount,
-    rail: onRail,
-    idempotencyKey: key,
-  });
+  sent(
+    requestWithdrawal(w.tenantId, w.asMember(memberId), memberId, {
+      currency: 'EUR',
+      amount,
+      rail: onRail,
+      idempotencyKey: key,
+    }),
+  );
 const monitor = async (tenantId: string) =>
   (await DBOS.startWorkflow(monitorWorkflow)(tenantId)).getResult();
 const settled = (w: World, memberId: string, id: string) =>
@@ -101,7 +103,7 @@ describe('withdrawals', () => {
   it('refuses a suspended member', async () => {
     const w = await makeWorld(rail, { net });
     await w.fund(w.retailer, 'EUR', eur('10'));
-    await suspendMember(w.tenantId, w.retailer);
+    await suspendMember(w.tenantId, w.platform, w.retailer, { reason: 'test' });
     await expect(withdraw(w, w.retailer, eur('5'))).rejects.toThrow('suspended');
   });
 
@@ -125,7 +127,8 @@ describe('what a member and a platform can see', () => {
     await w.fund(w.retailer, 'EUR', eur('100'));
     const { id } = await withdraw(w, w.retailer, eur('40'));
     await settled(w, w.retailer, id);
-    const lines = await memberStatement(w.tenantId, w.retailer);
+    const { lines, closingBalance } = await memberStatement(w.tenantId, w.retailer);
+    expect(closingBalance).toEqual([{ currency: 'EUR', amount: eur('60'), available: eur('60') }]);
     expect(lines.map((l) => [l.kind, l.amount])).toEqual(
       expect.arrayContaining([
         ['deposit', eur('100')],
@@ -154,12 +157,74 @@ describe('what a member and a platform can see', () => {
     const later = await dealEventFeed(w.tenantId, next);
     expect(later.events.every((e) => e.seq > next)).toBe(true);
   });
+
+  it('never moves the cursor past an event a slower transaction has yet to commit', async () => {
+    const w = await makeWorld(rail, { net });
+    await w.fund(w.brand, 'EUR', eur('50'));
+    const d = await w.deal({
+      program: 'net',
+      buyer: 'brand',
+      seller: 'supplier',
+      quantity: 5,
+      price: '10',
+    });
+    await waitFor(d.id, ['awaiting_conditions']);
+    const { db } = deps();
+    const drained = async (after: bigint) => {
+      let cursor = after;
+      const seen: { seq: bigint; type: string; payload: Record<string, unknown> }[] = [];
+      for (;;) {
+        const page = await dealEventFeed(w.tenantId, cursor);
+        if (!page.events.length) return { seen, cursor };
+        seen.push(...page.events);
+        cursor = page.next;
+      }
+    };
+    await expect.poll(async () => (await drained(0n)).seen.length).toBeGreaterThan(1);
+    const start = (await drained(0n)).cursor;
+
+    // The slow transaction takes the lower seq; a quick one takes a higher seq and commits first.
+    let release = () => {};
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    let written = () => {};
+    const slowWrote = new Promise<void>((r) => {
+      written = r;
+    });
+    const slow = db.transaction(async (t) => {
+      await record(t, d.id, 'fact_added', { probe: 'slow' });
+      written();
+      await held;
+    });
+    await slowWrote;
+    await db.transaction((t) => record(t, d.id, 'fact_added', { probe: 'quick' }));
+
+    const before = await drained(start);
+    expect(before.seen.map((e) => e.payload.probe)).not.toContain('quick');
+
+    release();
+    await slow;
+    // The deal's workflow keeps writing; while one of its transactions is open the feed withholds
+    // everything after it, so read on as a consumer would.
+    const probes: unknown[] = [];
+    let cursor = before.cursor;
+    await expect
+      .poll(async () => {
+        const page = await drained(cursor);
+        cursor = page.cursor;
+        probes.push(...page.seen.map((e) => e.payload.probe));
+        return probes;
+      })
+      .toEqual(expect.arrayContaining(['slow', 'quick']));
+    expect(probes.indexOf('slow')).toBeLessThan(probes.indexOf('quick'));
+  });
 });
 
 describe('manual stops', () => {
   it('refuses new deals from an agent that has been switched off', async () => {
     const w = await makeWorld(rail, { net });
-    await setAgentStatus(w.tenantId, w.retailerAgent, 'blocked');
+    await setAgentStatus(w.tenantId, w.platform, w.retailerAgent, 'blocked');
     const d = await w.deal({
       program: 'net',
       buyer: 'retailer',
@@ -172,7 +237,7 @@ describe('manual stops', () => {
 
   it('can stop all settlement for a tenant', async () => {
     const w = await makeWorld(rail, { net });
-    await stopSettlement(w.tenantId, { reason: 'operator stop' });
+    await stopSettlement(w.tenantId, w.platform, { reason: 'operator stop' });
     const [t] = await engine.db.select().from(tenants).where(eq(tenants.id, w.tenantId));
     expect(t?.settlementHaltReason).toBe('operator stop');
   });
@@ -211,7 +276,7 @@ describe('margin calls under strain', () => {
   it('does not let a margin default lift a suspension', async () => {
     const { w } = await short();
     await overdue(w);
-    await suspendMember(w.tenantId, w.brand);
+    await suspendMember(w.tenantId, w.platform, w.brand, { reason: 'test' });
     answering('declare_default');
     expect((await monitor(w.tenantId)).portfolio.defaults).toBe(1);
     const [m] = await engine.db.select().from(members).where(eq(members.id, w.brand));
@@ -243,9 +308,11 @@ describe('notifications', () => {
     const reason = `outage-${randomUUID()}`;
     await notify({ type: 'settlement_stopped', tenantId: randomUUID(), reason });
     await expect
-      .poll(() => notified.filter((n) => n.reason === reason).length, { timeout: 20_000 })
+      .poll(() => notified.filter((n) => 'reason' in n && n.reason === reason).length, {
+        timeout: 20_000,
+      })
       .toBe(1);
-    expect(notified.find((n) => n.reason === reason)?.id).toBeTruthy();
+    expect(notified.find((n) => 'reason' in n && n.reason === reason)?.id).toBeTruthy();
   });
 });
 
@@ -253,7 +320,7 @@ describe('work that must survive a failure', () => {
   it('retries a rail event that fails instead of losing the money', async () => {
     const w = await makeWorld(rail, { net });
     const account = `ga-${randomUUID()}`;
-    await setMemberRailRefs(w.tenantId, w.retailer, { orphans_deposit_account: account });
+    await assignRailRefs(w, w.retailer, { orphans_deposit_account: account });
     deps().railOwners.orphans = w.tenantId;
     const failOnce = vi.spyOn(deps().ledger, 'post').mockRejectedValueOnce(new Error('db blip'));
     try {
@@ -325,11 +392,39 @@ describe('work that must survive a failure', () => {
         transferMethods: ['LOCAL'] as ('LOCAL' | 'SWIFT')[],
         idempotencyKey: randomUUID(),
       };
-      await provisionMember(w.tenantId, w.retailer, input);
-      await provisionMember(w.tenantId, w.retailer, input);
+      await provisionMember(w.tenantId, w.house, w.retailer, input);
+      await provisionMember(w.tenantId, w.house, w.retailer, input);
       expect(calls).toBe(1);
       const [m] = await engine.db.select().from(members).where(eq(members.id, w.retailer));
       expect(m?.railRefs.orphans_deposit_account).toBe(`ga-${w.retailer}`);
+    } finally {
+      delete provisionable.provision;
+      delete deps().railOwners.orphans;
+    }
+  });
+  it('takes a rail refusal as the answer, without retrying it', async () => {
+    const w = await makeWorld(rail, { net });
+    deps().railOwners.orphans = w.tenantId;
+    let calls = 0;
+    const provisionable = orphans as unknown as {
+      provision?: () => Promise<Record<string, string>>;
+    };
+    provisionable.provision = async () => {
+      calls++;
+      throw new DomainError('rail_refused', 'No more EUR accounts in DE');
+    };
+    try {
+      await expect(
+        provisionMember(w.tenantId, w.house, w.retailer, {
+          rail: 'orphans',
+          countryCode: 'DE',
+          currency: 'EUR',
+          beneficiary: {},
+          transferMethods: ['LOCAL'],
+          idempotencyKey: randomUUID(),
+        }),
+      ).rejects.toMatchObject({ code: 'rail_refused', message: 'No more EUR accounts in DE' });
+      expect(calls).toBe(1);
     } finally {
       delete provisionable.provision;
       delete deps().railOwners.orphans;
@@ -357,7 +452,7 @@ describe('deposit events out of order', () => {
   it('nets to nothing for a member when the recall arrives first', async () => {
     const w = await makeWorld(rail, { net });
     const account = `ga-${randomUUID()}`;
-    await setMemberRailRefs(w.tenantId, w.retailer, { orphans_deposit_account: account });
+    await assignRailRefs(w, w.retailer, { orphans_deposit_account: account });
     deps().railOwners.orphans = w.tenantId;
     try {
       const ref = `dep-${randomUUID()}`;
@@ -381,7 +476,7 @@ describe('deposit events out of order', () => {
       await event('deposit.settled', ref, 'ga-nobody');
       await new Promise((r) => setTimeout(r, 1_500));
       expect(await unattributedDepositsOf(w.tenantId)).toHaveLength(0);
-      await runReconciliation(w.tenantId, 'orphans');
+      await reconcile(w.tenantId, 'orphans');
     } finally {
       delete deps().railOwners.orphans;
     }

@@ -8,12 +8,25 @@ import {
   dealDetail,
   type launchEngine,
   monitorWorkflow,
+  openCases,
   resumeSettlement,
   runCycle,
-  runReconciliation,
   submitFact,
+  tenantStatus,
 } from '../src/index.ts';
-import { boot, brain, eur, gbp, makeWorld, shutdown, waitFor } from './harness.ts';
+import {
+  boot,
+  brain,
+  controlEventsOf,
+  eur,
+  gbp,
+  makeWorld,
+  netProgram,
+  personDecides,
+  reconcile,
+  shutdown,
+  waitFor,
+} from './harness.ts';
 
 const rail = new MockRail();
 let engine: Awaited<ReturnType<typeof launchEngine>>;
@@ -22,11 +35,18 @@ beforeAll(async () => {
 });
 afterAll(() => shutdown());
 
-const net: ProgramSpecInput = {
-  ...presetInputs.netSettlement,
-  overrides: [],
-  settlement: { rail: 'mock', fundingWindow: '2s' },
-};
+async function waitForReconCase(tenantId: string, runId: string) {
+  let found: Awaited<ReturnType<typeof openCases>>[number] | undefined;
+  await expect
+    .poll(async () => {
+      found = (await openCases(tenantId)).find((c) => c.subjectId === runId);
+      return found;
+    })
+    .toBeDefined();
+  return found as NonNullable<typeof found>;
+}
+
+const net = netProgram({ settlement: { rail: 'mock', fundingWindow: '2s' } });
 
 describe('reconciliation', () => {
   it('stays clean through a normal cycle, then halts settlement on a real difference', async () => {
@@ -46,11 +66,11 @@ describe('reconciliation', () => {
     await runCycle(w.tenantId);
     await waitFor(d.id, ['settled']);
 
-    const clean = await runReconciliation(w.tenantId, 'mock');
+    const clean = await reconcile(w.tenantId, 'mock');
     expect(clean.breaks).toEqual([]);
 
     rail.corrupt('EUR', 500n);
-    const broken = await runReconciliation(w.tenantId, 'mock');
+    const broken = await reconcile(w.tenantId, 'mock');
     expect(broken.breaks[0]?.kind).toBe('balance_mismatch');
     expect(broken.halted).toBe(true);
 
@@ -67,7 +87,17 @@ describe('reconciliation', () => {
     expect((await runCycle(w.tenantId)).status).toBe('halted');
 
     rail.corrupt('EUR', -500n);
-    await resumeSettlement(w.tenantId);
+    // Fixing the rail is not enough: a person has to answer for the difference first.
+    await expect(resumeSettlement(w.tenantId, w.person, { reason: 'rail fixed' })).rejects.toThrow(
+      /1 unresolved break on Mock; case .* is waiting for a person/,
+    );
+    const recon = await waitForReconCase(w.tenantId, broken.runId);
+    await personDecides(w, recon.id, {
+      bindingHash: recon.bindingHash,
+      action: { type: 'acknowledge', note: 'Test corruption, since reversed' },
+      rationale: 'The rail balance was corrupted on purpose and put back',
+    });
+    await expect.poll(async () => (await tenantStatus(w.tenantId)).settlementHaltedAt).toBeNull();
     await w.fund(w.brand, 'EUR', eur('14'));
     expect((await runCycle(w.tenantId)).status).toBe('settled');
   });
@@ -158,6 +188,13 @@ describe('open-position monitor', () => {
       .from(agentsTable)
       .where(eq(agentsTable.id, w2.brandSeller));
     expect(row?.status).toBe('blocked');
+    const [suspended] = await controlEventsOf(w2.tenantId, 'agent_suspended');
+    expect(suspended?.actor).toEqual({ kind: 'system', via: 'system' });
+    expect(suspended?.payload).toMatchObject({
+      agentId: w2.brandSeller,
+      caseId: expect.any(String),
+      decidedBy: expect.any(String),
+    });
   });
 });
 

@@ -1,6 +1,4 @@
 import {
-  type MetalAttempt,
-  type MetalAttemptStore,
   type MetalClient,
   MetalRefusal,
   type MetalSettlement,
@@ -111,28 +109,5 @@ export class FakeMetal implements MetalClient {
 
   async transfers(from: bigint, to: bigint) {
     return this.#logs.filter((l) => l.block >= from && l.block <= to);
-  }
-}
-
-export class MemoryAttempts implements MetalAttemptStore {
-  rows: MetalAttempt[] = [];
-  fees = new Map<string, bigint>();
-  async find(key: string) {
-    return this.rows.find((r) => r.idempotencyKey === key);
-  }
-  async findByHash(hash: string) {
-    return this.rows.find((r) => r.txHash === hash);
-  }
-  async save(a: MetalAttempt) {
-    this.rows.push(a);
-  }
-  async discard(hash: string) {
-    this.rows = this.rows.filter((r) => r.txHash !== hash);
-  }
-  async recordFee(hash: string, fee: bigint) {
-    this.fees.set(hash, fee);
-  }
-  async totalFees() {
-    return [...this.fees.values()].reduce((a, b) => a + b, 0n);
   }
 }

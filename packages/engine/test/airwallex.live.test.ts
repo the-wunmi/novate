@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
 import { settlementInstructions } from '@novate/db';
 import { type ProgramSpecInput, presetInputs } from '@novate/policy';
 import { AirwallexRail } from '@novate/rails';
@@ -8,21 +6,29 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   deposit,
   type Engine,
-  provisionMember,
   publishProgram,
   recordRailOpening,
   runCycle,
-  runReconciliation,
   submitFact,
 } from '../src/index.ts';
-import { boot, eur, gbp, makeWorld, shutdown, type World, waitFor } from './harness.ts';
+import {
+  boot,
+  eur,
+  gbp,
+  liveAccounts,
+  makeWorld,
+  netProgram,
+  reconcile,
+  shutdown,
+  type World,
+  waitFor,
+} from './harness.ts';
 
-const envFile = new URL('../../../.env', import.meta.url).pathname;
-if (existsSync(envFile)) process.loadEnvFile(envFile);
 const { AIRWALLEX_CLIENT_ID, AIRWALLEX_API_KEY } = process.env;
+// Real sandbox money, so only `pnpm test:live` runs it.
 const live = Boolean(AIRWALLEX_CLIENT_ID && AIRWALLEX_API_KEY);
 
-/** The end state against the real Airwallex sandbox. Skipped until keys are in `.env`. */
+/** The end state against the real Airwallex sandbox. Run by `pnpm test:live` with keys in `.env`. */
 describe.skipIf(!live)('mug scenario on the Airwallex sandbox (live)', () => {
   const rail = new AirwallexRail({
     clientId: AIRWALLEX_CLIENT_ID as string,
@@ -34,37 +40,7 @@ describe.skipIf(!live)('mug scenario on the Airwallex sandbox (live)', () => {
 
   const settlement = { netting: 'multilateral', rail: 'airwallex', confirmWithin: '1h' } as const;
   const trade: ProgramSpecInput = { ...presetInputs.tradeAssurance, overrides: [], settlement };
-  const netted: ProgramSpecInput = {
-    ...presetInputs.netSettlement,
-    overrides: [],
-    settlement: { ...settlement, fundingWindow: '2m' },
-  };
-
-  const provision = (w: World, memberId: string, currency: string, countryCode: string) =>
-    provisionMember(w.tenantId, memberId, {
-      idempotencyKey: randomUUID(),
-      rail: 'airwallex',
-      countryCode,
-      currency,
-      transferMethods: ['LOCAL'],
-      beneficiary: {
-        entity_type: 'COMPANY',
-        company_name: `novate test ${memberId.slice(0, 6)}`,
-        address: {
-          country_code: 'NL',
-          city: 'Amsterdam',
-          street_address: 'Damrak 1',
-          postcode: '1012LG',
-        },
-        bank_details: {
-          account_currency: 'EUR',
-          account_name: 'novate test',
-          bank_country_code: 'NL',
-          iban: 'NL91ABNA0417164300',
-          swift_code: 'ABNANL2A',
-        },
-      },
-    });
+  const netted = netProgram({ settlement: { ...settlement, fundingWindow: '2m' } });
 
   /** Simulate money arriving, then credit the ledger as the webhook would. */
   async function fund(w: World, memberId: string, currency: string, amount: bigint) {
@@ -77,7 +53,8 @@ describe.skipIf(!live)('mug scenario on the Airwallex sandbox (live)', () => {
   }
 
   beforeAll(async () => {
-    engine = await boot(rail);
+    // A real rail is retried and polled at production pace.
+    engine = await boot(rail, [], { pace: 1 });
     // Sandbox transfers stay in flight until told otherwise, and must pass through SENT.
     paying = setInterval(async () => {
       const inFlight = await engine.db
@@ -101,9 +78,9 @@ describe.skipIf(!live)('mug scenario on the Airwallex sandbox (live)', () => {
   it('settles trade assurance, then net settlement after a program switch', async () => {
     const w = await makeWorld(rail as never, { 'trade-assurance': trade });
     await recordRailOpening(w.tenantId, 'airwallex');
-    await provision(w, w.brand, 'GBP', 'GB');
-    await provision(w, w.retailer, 'EUR', 'DE');
-    await provision(w, w.supplier, 'EUR', 'DE');
+    await liveAccounts(w, rail, w.brand, 'brand', 'GBP', 'GB');
+    await liveAccounts(w, rail, w.retailer, 'retailer', 'EUR', 'DE');
+    await liveAccounts(w, rail, w.supplier, 'supplier', 'EUR', 'DE');
     await fund(w, w.brand, 'GBP', gbp('15000'));
     await fund(w, w.retailer, 'EUR', eur('9000'));
     await fund(w, w.supplier, 'EUR', eur('1000'));
@@ -124,9 +101,9 @@ describe.skipIf(!live)('mug scenario on the Airwallex sandbox (live)', () => {
 
     expect((await runCycle(w.tenantId)).status).toBe('settled');
     await waitFor(buy.id, ['settled'], 120_000);
-    expect(await runReconciliation(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
+    expect(await reconcile(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
 
-    await publishProgram(w.tenantId, { key: 'net', spec: netted });
+    await publishProgram(w.tenantId, w.platform, { key: 'net', spec: netted });
     await fund(w, w.retailer, 'EUR', eur('500'));
     const net = await w.deal({
       program: 'net',
@@ -144,6 +121,6 @@ describe.skipIf(!live)('mug scenario on the Airwallex sandbox (live)', () => {
     await waitFor(net.id, ['eligible'], 60_000);
     expect((await runCycle(w.tenantId)).status).toBe('settled');
     await waitFor(net.id, ['settled'], 120_000);
-    expect(await runReconciliation(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
+    expect(await reconcile(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
   }, 600_000);
 });

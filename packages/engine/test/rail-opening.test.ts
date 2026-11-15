@@ -1,7 +1,7 @@
 import { MockRail } from '@novate/rails';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { deposit, type Engine, recordRailOpening, runReconciliation } from '../src/index.ts';
-import { boot, eur, makeWorld, shutdown } from './harness.ts';
+import { deposit, type Engine, recordRailOpening } from '../src/index.ts';
+import { boot, eur, makeWorld, reconcile, shutdown } from './harness.ts';
 
 const main = new MockRail();
 let engine: Engine;
@@ -24,7 +24,7 @@ describe('money already on the account when a rail is connected', () => {
     const rail = account('funded-before');
     rail.simulateDeposit('EUR', eur('5000'), 'before-novate');
     await recordRailOpening(w.tenantId, 'funded-before');
-    expect(await runReconciliation(w.tenantId, 'funded-before')).toMatchObject({
+    expect(await reconcile(w.tenantId, 'funded-before')).toMatchObject({
       status: 'clean',
       halted: false,
     });
@@ -35,9 +35,8 @@ describe('money already on the account when a rail is connected', () => {
     const rail = account('funded-after');
     rail.simulateDeposit('EUR', eur('5000'), 'before-novate');
     await recordRailOpening(w.tenantId, 'funded-after');
-    await new Promise((done) => setTimeout(done, 5));
     rail.simulateDeposit('EUR', eur('7'), 'unexplained');
-    const result = await runReconciliation(w.tenantId, 'funded-after');
+    const result = await reconcile(w.tenantId, 'funded-after');
     expect(result.halted).toBe(true);
     expect(result.breaks.map((b) => b.externalRef ?? b.expected)).toEqual([
       eur('5000'),
@@ -51,7 +50,7 @@ describe('money already on the account when a rail is connected', () => {
     rail.simulateDeposit('EUR', eur('5000'), 'before-novate');
     await recordRailOpening(w.tenantId, 'drained');
     rail.corrupt('EUR', -eur('5000'));
-    const result = await runReconciliation(w.tenantId, 'drained');
+    const result = await reconcile(w.tenantId, 'drained');
     expect(result.breaks[0]).toMatchObject({
       kind: 'balance_mismatch',
       expected: eur('5000'),
@@ -66,14 +65,13 @@ describe('money already on the account when a rail is connected', () => {
     await recordRailOpening(w.tenantId, 'opened-twice');
     rail.corrupt('EUR', eur('1'));
     await recordRailOpening(w.tenantId, 'opened-twice');
-    expect((await runReconciliation(w.tenantId, 'opened-twice')).status).toBe('breaks');
+    expect((await reconcile(w.tenantId, 'opened-twice')).status).toBe('breaks');
   });
 
   it('books a rail fee on known money as a house cost, even in a currency nobody holds', async () => {
     const w = await makeWorld(main);
     const rail = account('fee-charged');
     await recordRailOpening(w.tenantId, 'fee-charged');
-    await new Promise((done) => setTimeout(done, 5));
     rail.simulateDeposit('EUR', eur('100'), 'dep-1');
     await deposit(w.tenantId, {
       memberId: w.retailer,
@@ -83,9 +81,9 @@ describe('money already on the account when a rail is connected', () => {
       externalRef: 'dep-1',
     });
     rail.simulateFee('USD', 1500n, 'dep-1');
-    expect((await runReconciliation(w.tenantId, 'fee-charged')).status).toBe('clean');
+    expect((await reconcile(w.tenantId, 'fee-charged')).status).toBe('clean');
     // Posted once, however many times it is seen.
-    expect((await runReconciliation(w.tenantId, 'fee-charged')).status).toBe('clean');
+    expect((await reconcile(w.tenantId, 'fee-charged')).status).toBe('clean');
 
     rail.simulateDeposit('EUR', eur('40'), 'dep-2');
     await deposit(w.tenantId, {
@@ -96,15 +94,14 @@ describe('money already on the account when a rail is connected', () => {
       externalRef: 'dep-2',
     });
     rail.simulateFee('USD', 1500n, 'dep-2');
-    expect((await runReconciliation(w.tenantId, 'fee-charged')).status).toBe('clean');
+    expect((await reconcile(w.tenantId, 'fee-charged')).status).toBe('clean');
   });
 
   it('still stops for a fee on something it does not recognise', async () => {
     const w = await makeWorld(main);
     const rail = account('fee-unknown');
     await recordRailOpening(w.tenantId, 'fee-unknown');
-    await new Promise((done) => setTimeout(done, 5));
     rail.simulateFee('USD', 1500n, 'never-seen');
-    expect((await runReconciliation(w.tenantId, 'fee-unknown')).halted).toBe(true);
+    expect((await reconcile(w.tenantId, 'fee-unknown')).halted).toBe(true);
   });
 });

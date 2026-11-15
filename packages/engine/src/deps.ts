@@ -49,6 +49,11 @@ export interface EngineDeps {
   /** Which tenant owns each rail account. Rails with no owner are never reconciled on a schedule. */
   railOwners: Record<string, string>;
   fxSampleRail?: string;
+  /**
+   * Scales every pause the engine times itself: retries, polls and settle windows. 1 in production.
+   * Tests shrink it so a retry costs milliseconds and still runs the same path.
+   */
+  pace: number;
 }
 
 let current: EngineDeps | undefined;
@@ -56,6 +61,9 @@ let current: EngineDeps | undefined;
 export function setDeps(deps: EngineDeps): void {
   current = deps;
 }
+
+/** A pause of `ms` at the engine's pace. */
+export const paced = (ms: number): number => ms * deps().pace;
 
 export function deps(): EngineDeps {
   if (!current) throw new Error('Engine not launched — call launchEngine() first');
@@ -75,8 +83,22 @@ export function tx<T>(name: string, fn: (db: Tx) => Promise<T>): Promise<T> {
 }
 
 /** A call to a rail or other network dependency, retried by DBOS and checkpointed once it returns. */
-export function networkStep<T>(name: string, fn: () => Promise<T>): Promise<T> {
-  return DBOS.runStep(fn, { name, retriesAllowed: true, maxAttempts: 5 });
+export async function networkStep<T>(name: string, fn: () => Promise<T>): Promise<T> {
+  // A refusal is an answer, not an outage: it is recorded once and never retried.
+  const out = await DBOS.runStep(
+    async (): Promise<{ ok: T } | { refused: { code: DomainError['code']; message: string } }> => {
+      try {
+        return { ok: await fn() };
+      } catch (err) {
+        if (err instanceof DomainError)
+          return { refused: { code: err.code, message: err.message } };
+        throw err;
+      }
+    },
+    { name, retriesAllowed: true, maxAttempts: 5, intervalSeconds: paced(1_000) / 1_000 },
+  );
+  if ('refused' in out) throw new DomainError(out.refused.code, out.refused.message);
+  return out.ok;
 }
 
 /**
@@ -98,7 +120,7 @@ export async function pollWhileSubmitted<R extends { status: string; externalRef
 ): Promise<R> {
   let result = first;
   for (let i = 0; result.status === 'submitted' && i < maxPolls; i++) {
-    await DBOS.sleep(Math.min(60_000, 500 * 2 ** i));
+    await DBOS.sleep(paced(Math.min(60_000, 500 * 2 ** i)));
     const { externalRef } = result;
     result = await networkStep(name, () => fetch(externalRef));
   }

@@ -4,7 +4,7 @@ import { dealAmount } from '@novate/core';
 import {
   type Action,
   type ActionContext,
-  ALLOWED_ACTIONS,
+  allowedActions,
   type CaseView,
   DecisionLimits,
   firstAccepted,
@@ -32,7 +32,7 @@ const { values: args } = parseArgs({
 });
 
 const CEILING = { EUR: 20_000_000 };
-/** Production gives a model this many tries after code refuses its proposal. */
+/** The default `decisions.modelAttempts`: proposals a model may make before the case goes on. */
 const MODEL_ATTEMPTS = 2;
 
 interface Outcome {
@@ -75,7 +75,7 @@ function viewOf(c: DecisionEval): CaseView {
     reason: c.reason,
     bindingHash: 'eval',
     shown: c.deal ? { ...base, deal: c.deal, facts: c.facts ?? [] } : base,
-    allowedActions: ALLOWED_ACTIONS[c.kind],
+    allowedActions: allowedActions(c.kind, c.claimant),
   };
 }
 
@@ -96,6 +96,7 @@ function contextOf(c: DecisionEval, action: Action): ActionContext {
     memberIds: c.memberIds,
     agentIds: c.agentIds,
     attemptsLeft: (c.evidence.retriesLeft ?? c.evidence.attemptsLeft) as number | undefined,
+    claimant: c.claimant,
   };
 }
 

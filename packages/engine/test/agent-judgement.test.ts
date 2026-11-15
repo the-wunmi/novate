@@ -1,17 +1,20 @@
 import { randomUUID } from 'node:crypto';
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { cycles, decisionCases, decisionOutcomes } from '@novate/db';
-import { type CaseView, type ProgramSpecInput, presetInputs } from '@novate/policy';
+import type { CaseView, ProgramSpecInput } from '@novate/policy';
 import { MockRail } from '@novate/rails';
 import { and, eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { deps } from '../src/deps.ts';
 import {
+  activityFeed,
   decisionFeed,
+  decisionSummary,
   decisionTrail,
   type launchEngine,
   monitorWorkflow,
   openCases,
+  recheckDecision,
   runCycle,
   settleDueGroups,
   shadowRunDetail,
@@ -19,7 +22,7 @@ import {
   submitFact,
   trackRecords,
 } from '../src/index.ts';
-import { boot, brain, eur, makeWorld, notified, shutdown, waitFor } from './harness.ts';
+import { boot, brain, eur, makeWorld, netProgram, notified, shutdown, waitFor } from './harness.ts';
 
 const rail = new MockRail();
 let engine: Awaited<ReturnType<typeof launchEngine>>;
@@ -29,12 +32,7 @@ beforeAll(async () => {
 afterAll(() => shutdown());
 
 type World = Awaited<ReturnType<typeof makeWorld>>;
-const net: ProgramSpecInput = {
-  ...presetInputs.netSettlement,
-  overrides: [],
-  signals: ['history'],
-  settlement: { rail: 'mock' },
-};
+const net = netProgram({ signals: ['history'] });
 const monitor = async (tenantId: string) =>
   (await DBOS.startWorkflow(monitorWorkflow)(tenantId)).getResult();
 const accept = (w: World, dealId: string, memberId: string) =>
@@ -189,7 +187,7 @@ describe('decision records', () => {
   it('tells the whole story of a decision, refusals and money included', async () => {
     const { w } = await decided();
     await monitor(w.tenantId);
-    const [entry] = await decisionFeed(w.tenantId);
+    const [entry] = (await decisionFeed(w.tenantId)).rows;
     expect(entry).toMatchObject({ kind: 'frozen', verdict: 'good' });
     const trail = await decisionTrail(w.tenantId, entry?.id as string);
     expect(trail.untampered).toBe(true);
@@ -197,14 +195,95 @@ describe('decision records', () => {
       ['waive', false],
       ['confirm', true],
     ]);
-    expect(trail.steps[0]?.refusedBecause[0]).toContain('not allowed');
+    expect(trail.steps[0]?.checks.find((c) => !c.passed)?.text).toContain('not allowed');
     expect(trail.events.map((e) => e.type)).toContain('settled');
     expect(trail.outcome?.verdict).toBe('good');
+    // Novation goes in to the house and out of it; the story tells it once.
+    expect(trail.money.filter((m) => m.kind === 'novation')).toEqual([
+      expect.objectContaining({ amount: eur('100'), currency: 'EUR' }),
+    ]);
+  });
+
+  it('counts decisions over a period by who made them', async () => {
+    const start = new Date().toISOString();
+    const { w } = await decided();
+    expect(await decisionSummary(w.tenantId, { from: start })).toMatchObject({
+      decided: 1,
+      byRule: 0,
+      byModel: 1,
+      byPerson: 0,
+    });
+    const later = new Date(Date.now() + 60_000).toISOString();
+    expect(await decisionSummary(w.tenantId, { from: later })).toMatchObject({ decided: 0 });
+  });
+
+  it('judges a decision as soon as its deal settles, however early it was first looked at', async () => {
+    const w = await makeWorld(rail, { p: freeze });
+    await w.fund(w.retailer, 'EUR', eur('100'));
+    answering(() => ({ type: 'confirm' }));
+    const d = await buy(w, '10');
+    await waitFor(d.id, ['awaiting_conditions']);
+    await monitor(w.tenantId);
+    const judged = () =>
+      engine.db.select().from(decisionOutcomes).where(eq(decisionOutcomes.tenantId, w.tenantId));
+    expect(await judged()).toEqual([]);
+    await settle(w, d.id);
+    await monitor(w.tenantId);
+    expect(await judged()).toEqual([expect.objectContaining({ verdict: 'good' })]);
+  });
+
+  it('records every rule code checked, passed or not', async () => {
+    const { w } = await decided();
+    const [entry] = (await decisionFeed(w.tenantId)).rows;
+    const trail = await decisionTrail(w.tenantId, entry?.id as string);
+    const confirm = trail.steps.find((s) => s.accepted);
+    expect(confirm?.checks.every((c) => c.passed)).toBe(true);
+    expect(confirm?.checks.map((c) => c.text)).toContain(
+      'the amount is within the ceiling for automated decisions',
+    );
+    const ceiling = confirm?.checks.find((c) => c.measure);
+    // Ten units at 10 EUR, in minor units.
+    expect(ceiling?.measure).toMatchObject({ currency: 'EUR', amount: String(eur('100')) });
+    const waive = trail.steps.find((s) => !s.accepted);
+    expect(waive?.checks.filter((c) => !c.passed).map((c) => c.code)).toEqual(['allowed_action']);
+  });
+
+  it('shows the same choice refused under a tighter ceiling, and changes nothing', async () => {
+    const { w } = await decided();
+    const [entry] = (await decisionFeed(w.tenantId)).rows;
+    const before = await decisionTrail(w.tenantId, entry?.id as string);
+    const tight = await recheckDecision(w.tenantId, entry?.id as string, { ceiling: { EUR: 100 } });
+    expect(tight).toMatchObject({ accepted: false, action: { type: 'confirm' } });
+    expect(tight.checks.find((c) => !c.passed)?.text).toContain('above the program ceiling');
+    const loose = await recheckDecision(w.tenantId, entry?.id as string, {
+      ceiling: { EUR: 900_000_000 },
+    });
+    expect(loose.accepted).toBe(true);
+    expect((await decisionTrail(w.tenantId, entry?.id as string)).steps).toEqual(before.steps);
+    await expect(
+      recheckDecision(randomUUID(), entry?.id as string, { ceiling: { EUR: 1 } }),
+    ).rejects.toThrow('not found');
+  });
+
+  it('tells who did what across the house, newest first', async () => {
+    const { w } = await decided();
+    const feed = (await activityFeed(w.tenantId)).rows;
+    const decisions = feed.flatMap((a) => (a.source === 'decision' ? [a] : []));
+    expect(decisions.map((d) => [d.type, d.detail.decider, d.detail.accepted])).toEqual(
+      expect.arrayContaining([
+        ['waive', 'model', false],
+        ['confirm', 'model', true],
+      ]),
+    );
+    expect(feed.some((a) => a.source === 'deal' && a.type === 'frozen')).toBe(true);
+    const times = feed.map((a) => a.at.getTime());
+    expect(times).toEqual([...times].sort((a, b) => b - a));
+    expect((await activityFeed(randomUUID())).rows).toEqual([]);
   });
 
   it('keeps another tenant out of a decision', async () => {
     const { w } = await decided();
-    const [entry] = await decisionFeed(w.tenantId);
+    const [entry] = (await decisionFeed(w.tenantId)).rows;
     await expect(decisionTrail(randomUUID(), entry?.id as string)).rejects.toThrow('not found');
   });
 

@@ -1,20 +1,64 @@
-import { type DealStatus, DomainError } from '@novate/core';
+import {
+  type ControlActor,
+  type DealStatus,
+  DealTerms,
+  DomainError,
+  type StoredDealTerms,
+} from '@novate/core';
 import {
   agents,
   dealEvents,
   dealFacts,
   deals,
+  type decisionCases,
   members,
   programs,
   settlementInstructions,
   type Tx,
   tenants,
 } from '@novate/db';
-import { type Fact, ProgramSpec, type ResolvedPolicy } from '@novate/policy';
+import { Action, type Fact, ProgramSpec, type ResolvedPolicy } from '@novate/policy';
 import type { SignalReading } from '@novate/signals';
-import { and, asc, count, eq, inArray, ne } from 'drizzle-orm';
+import { and, asc, count, eq, gt, inArray, ne, notExists, sql } from 'drizzle-orm';
+import { alias } from 'drizzle-orm/pg-core';
+import { recordControl } from './control.ts';
 
 export type DealRow = typeof deals.$inferSelect;
+export type DealEventType = (typeof dealEvents.$inferInsert)['type'];
+
+/** A deal as read models show it: its terms parsed, so amounts and defaults are filled in. */
+export const withTerms = <T extends { terms: StoredDealTerms }>(deal: T) => ({
+  ...deal,
+  terms: DealTerms.parse(deal.terms),
+});
+
+/** The action that closed a decided case, parsed again so its amounts have their real types. */
+export function decidedAction(c: typeof decisionCases.$inferSelect): Action {
+  if (!c.resolution) throw new Error(`Case ${c.id} has not been decided`);
+  return Action.parse(c.resolution.action);
+}
+
+const laterAttempt = alias(settlementInstructions, 'later_attempt');
+
+/**
+ * Holds for a settlement instruction that is the latest attempt at its payment: no retry of the
+ * same cycle, member, currency and direction has replaced it.
+ */
+export const latestAttempt = (db: Tx) =>
+  notExists(
+    db
+      .select({ one: sql`1` })
+      .from(laterAttempt)
+      .where(
+        and(
+          eq(laterAttempt.cycleId, settlementInstructions.cycleId),
+          eq(laterAttempt.memberId, settlementInstructions.memberId),
+          eq(laterAttempt.currency, settlementInstructions.currency),
+          eq(laterAttempt.direction, settlementInstructions.direction),
+          gt(laterAttempt.attempt, settlementInstructions.attempt),
+        ),
+      ),
+  );
 export type MemberRow = typeof members.$inferSelect;
 export type AgentRow = typeof agents.$inferSelect;
 export type ProgramRow = typeof programs.$inferSelect;
@@ -67,26 +111,64 @@ export async function loadProgramSpec(db: Tx, deal: DealRow): Promise<ProgramSpe
   return ProgramSpec.parse((await getProgram(db, deal.programId)).spec);
 }
 
-/** Membership of the tenant is the access check, and a miss reads the same as not existing. */
-export async function memberInTenant(db: Tx, tenantId: string, memberId: string) {
-  const member = await getMember(db, memberId);
-  if (member.tenantId !== tenantId) throw new DomainError('not_found', 'Member not found');
-  return member;
+/** Belonging to the tenant is the access check, and a miss reads the same as not existing. */
+export function inTenant<T extends { tenantId: string }>(
+  row: T | undefined,
+  tenantId: string,
+  label: string,
+): T {
+  if (row?.tenantId !== tenantId) throw new DomainError('not_found', `${label} not found`);
+  return row;
 }
 
-/** Stop new settlement for a tenant until someone with a house key resumes it. */
-export async function haltSettlement(db: Tx, tenantId: string, reason: string): Promise<void> {
+export const memberInTenant = async (db: Tx, tenantId: string, memberId: string) =>
+  inTenant(await getMember(db, memberId), tenantId, 'Member');
+
+export const agentInTenant = async (db: Tx, tenantId: string, agentId: string) =>
+  inTenant(await getAgent(db, agentId), tenantId, 'Agent');
+
+export const dealInTenant = async (db: Tx, tenantId: string, dealId: string) =>
+  inTenant(await getDeal(db, dealId), tenantId, 'Deal');
+
+/**
+ * Serialise one kind of tenant-wide write, such as settings changes or the day's sign-off, until the
+ * transaction ends. An advisory lock, not a lock on the tenant row, so it never holds up the
+ * tenant's other writes.
+ */
+export async function lockTenantFor(db: Tx, tenantId: string, purpose: 'settings' | 'sign_off') {
+  await db.execute(sql`select pg_advisory_xact_lock(hashtext(${`${tenantId}:${purpose}`}))`);
+}
+
+/**
+ * Stop new settlement for a tenant until a signed-in person resumes it. The house stopping
+ * itself again while already stopped changes nothing, so repeated checks do not flood the record
+ * and the row's reason always belongs to the latest recorded stop.
+ */
+export async function haltSettlement(
+  db: Tx,
+  tenantId: string,
+  actor: ControlActor,
+  reason: string,
+  payload?: Record<string, unknown>,
+): Promise<void> {
+  const [before] = await db
+    .select({ haltedAt: tenants.settlementHaltedAt })
+    .from(tenants)
+    .where(eq(tenants.id, tenantId))
+    .for('update');
+  if (actor.kind === 'system' && before?.haltedAt) return;
   await db
     .update(tenants)
     .set({ settlementHaltedAt: new Date(), settlementHaltReason: reason })
     .where(eq(tenants.id, tenantId));
+  await recordControl(db, tenantId, actor, { type: 'settlement_stopped', reason, payload });
 }
 
 export async function setStatus(
   db: Tx,
   dealId: string,
   status: DealStatus,
-  event: { type: string; payload?: Record<string, unknown> },
+  event: { type: DealEventType; payload?: Record<string, unknown> },
   reason?: string | null,
 ): Promise<void> {
   await db
@@ -99,10 +181,11 @@ export async function setStatus(
 export async function record(
   db: Tx,
   dealId: string,
-  type: string,
+  type: DealEventType,
   payload: Record<string, unknown> = {},
 ): Promise<void> {
-  await db.insert(dealEvents).values({ dealId, type, payload: payload });
+  const tenantId = sql<string>`(select ${deals.tenantId} from ${deals} where ${deals.id} = ${dealId})`;
+  await db.insert(dealEvents).values({ tenantId, dealId, type, payload });
 }
 
 export async function listFacts(db: Tx, dealId: string): Promise<Fact[]> {

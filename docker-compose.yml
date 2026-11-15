@@ -1,6 +1,8 @@
 services:
   postgres:
     image: postgres:17-alpine
+    # The test suites run in parallel, each worker with its own engine (see packages/db/src/test-databases.ts).
+    command: ["postgres", "-c", "max_connections=300"]
     environment:
       POSTGRES_USER: novate
       POSTGRES_PASSWORD: novate

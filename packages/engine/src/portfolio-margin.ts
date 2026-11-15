@@ -5,6 +5,7 @@ import { type MarginRequirement, marginRequirement, type OpenExposure } from '@n
 import { Accounts } from '@novate/ledger';
 import { type Decisions, durationMs, type PortfolioMargin } from '@novate/policy';
 import { and, eq, inArray, lte, or } from 'drizzle-orm';
+import { recordControl, SYSTEM } from './control.ts';
 import { resolveCase } from './decisions.ts';
 import { deps, isWorkflowControl, networkStep, tryPost, tx } from './deps.ts';
 import { memberHoldings } from './funds.ts';
@@ -68,8 +69,7 @@ const pairKey = (currency: string, home: string) => `${currency}/${home}`;
 
 function positionOf(deal: DealRow): Position | null {
   const policy = snapshotOf(deal).resolved.policy;
-  // Deals snapshotted before this block existed have nothing to assess.
-  if (policy.portfolioMargin?.mode !== 'required') return null;
+  if (policy.portfolioMargin.mode !== 'required') return null;
   return {
     deal,
     params: policy.portfolioMargin,
@@ -458,10 +458,23 @@ async function decideDueCall(
   const defaulted = await tx('margin_default', async (db) => {
     if (!(await closeCall(db, call, 'defaulted'))) return false;
     // Only from active: a member already suspended must stay shut out of settlement.
-    await db
+    const moved = await db
       .update(members)
       .set({ status: 'close_only' })
-      .where(and(eq(members.id, memberId), eq(members.status, 'active')));
+      .where(and(eq(members.id, memberId), eq(members.status, 'active')))
+      .returning({ id: members.id });
+    if (moved.length) {
+      await recordControl(db, call.tenantId, SYSTEM, {
+        type: 'member_close_only',
+        reason: 'Did not meet a margin call in time',
+        payload: {
+          memberId,
+          marginCallId: call.id,
+          caseId: res.caseId,
+          decidedBy: res.outcome === 'decided' ? res.decider.id : null,
+        },
+      });
+    }
     return true;
   });
   if (!defaulted) return;
@@ -489,7 +502,7 @@ export async function memberMargin(tenantId: string, memberId: string) {
       ),
     );
   const posted = await tx('member_margin', async (t) =>
-    (await memberHoldings(t, tenantId, 'portfolio_margin')).filter((h) => h.memberId === memberId),
+    memberHoldings(t, tenantId, 'portfolio_margin', { memberId }),
   );
   return {
     posted: posted.map(({ currency, amount }) => ({ currency, amount })),

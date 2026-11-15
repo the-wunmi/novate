@@ -1,0 +1,43 @@
+{
+  "account_name": "Dutch retailer",
+  "account_number": "88888888",
+  "account_type": "Checking",
+  "country_code": "GB",
+  "iban": "GB81LHVB04032900176471",
+  "id": "7f687fe6-dcf4-4462-92fa-80335301d9d2",
+  "institution": {
+    "address": "Old Street Yard",
+    "branch_name": "London",
+    "city": "London",
+    "name": "Saxo Payments A/S",
+    "zip_code": "018982"
+  },
+  "nick_name": "novate member GBP",
+  "request_id": "7f687fe6-dcf4-4462-92fa-80335301d9d2",
+  "required_features": [{ "currency": "GBP", "transfer_method": "LOCAL" }],
+  "status": "ACTIVE",
+  "supported_features": [
+    {
+      "alias_types": [],
+      "currency": "GBP",
+      "local_clearing_system": "FPS",
+      "routing_codes": [{ "type": "sort_code", "value": "040329" }],
+      "transfer_method": "LOCAL",
+      "type": "DEPOSIT"
+    },
+    {
+      "alias_types": [],
+      "currency": "GBP",
+      "routing_codes": [{ "type": "swift", "value": "SXPYDEHH" }],
+      "transfer_method": "SWIFT",
+      "type": "DEPOSIT"
+    },
+    {
+      "currency": "GBP",
+      "routing_codes": [{ "type": "sort_code", "value": "999999" }],
+      "transfer_method": "LOCAL",
+      "type": "DIRECT_DEBIT"
+    }
+  ],
+  "swift_code": "SXPYDEHH"
+}

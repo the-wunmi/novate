@@ -1,5 +1,5 @@
 import { DBOS } from '@dbos-inc/dbos-sdk';
-import { minBig, mulDivUp } from '@novate/core';
+import { applyBps, type ControlActor, maxBig, minBig, mulDivUp } from '@novate/core';
 import {
   cycles,
   deals,
@@ -13,31 +13,43 @@ import {
 } from '@novate/db';
 import {
   boughtAtMarket,
-  type FxCollateral,
   type FxNeed,
   type FxPlan,
   type MarketConversion,
   type MemberExchange,
   planFx,
 } from '@novate/fx';
-import { type AccountSpec, Accounts, type TransferInput } from '@novate/ledger';
-import { type NettableObligation, type NettingMode, net } from '@novate/netting';
+import { type AccountSpec, Accounts, programFeeKind, type TransferInput } from '@novate/ledger';
+import { type NettingMode, net } from '@novate/netting';
 import { durationMs, type ResolvedPolicy, Settlement } from '@novate/policy';
 import type { FxResult, RailResult, SettlementRail } from '@novate/rails';
 import { and, asc, desc, eq, inArray, notInArray, or } from 'drizzle-orm';
+import { recordControl, SYSTEM } from './control.ts';
 import type { SettlementMessage } from './deal-workflow.ts';
 import { type CaseResolution, type CaseSpec, resolveCase } from './decisions.ts';
-import { deps, isWorkflowControl, networkStep, pollWhileSubmitted, tryPost, tx } from './deps.ts';
+import {
+  deps,
+  isWorkflowControl,
+  networkStep,
+  paced,
+  pollWhileSubmitted,
+  tryPost,
+  tx,
+} from './deps.ts';
 import { memberHoldings } from './funds.ts';
+import { nettingInput } from './netting-input.ts';
 import { notify } from './notifications.ts';
+import { railBreakHold } from './recon-breaks.ts';
 import { strictestDecisions } from './reconciliation.ts';
 import {
+  type DealRow,
   escrowCurrency,
   fundingRecords,
   getMember,
   haltSettlement,
   type PolicySnapshot,
   record,
+  snapshotOf,
 } from './repo.ts';
 import { parseGroup, shortKey } from './settlement-group.ts';
 import { Topics } from './topics.ts';
@@ -52,6 +64,7 @@ export const PLAN_CONVERT_NOW = 'convert_now';
 export const PLAN_DEFER_CYCLE = 'defer_cycle';
 
 type Instruction = typeof settlementInstructions.$inferSelect;
+type Obligation = typeof obligations.$inferSelect;
 type Policy = ResolvedPolicy['policy'];
 type Totals = ReturnType<typeof net>['totals'];
 
@@ -61,6 +74,8 @@ export interface CycleSummary {
   obligations: number;
   totals: Totals;
   failures: { memberId: string; reason: string }[];
+  /** Why the cycle did not run, when it was deferred before claiming anything. */
+  reason?: string;
   /** What went to the FX market, against what would have without netting. */
   fx?: { boughtNet: Record<string, bigint>; boughtGross: Record<string, bigint> };
 }
@@ -131,7 +146,7 @@ async function failSafe(tenantId: string, cycleId: string, err: Error): Promise<
       .update(cycles)
       .set({ status: 'failed', closedAt: new Date(), summary: { error: reason } })
       .where(eq(cycles.id, cycleId));
-    await haltSettlement(db, tenantId, reason);
+    await haltSettlement(db, tenantId, SYSTEM, reason);
   });
   await notify({ type: 'settlement_stopped', tenantId, reason });
   return summary(cycleId, 'failed', { failures: [{ memberId: 'house', reason }] });
@@ -148,6 +163,9 @@ async function settleGroup(
     return Boolean(t?.settlementHaltedAt);
   });
   if (halted) return summary(cycleId, 'halted');
+  // A difference nobody has closed on this rail means the books cannot be trusted to pay from.
+  const held = await tx('open_breaks', (db) => railBreakHold(db, tenantId, parseGroup(group).rail));
+  if (held) return summary(cycleId, 'deferred', { reason: held });
   // Only a scheduled run can be held. Someone asking for settlement now gets it now.
   if (scheduled && (await treasuryHolds(tenantId, cycleId, group))) {
     await tx('treasury_hold', (db) =>
@@ -156,6 +174,7 @@ async function settleGroup(
         .values({
           id: cycleId,
           tenantId,
+          kind: 'settlement',
           settlementGroup: group,
           status: 'deferred',
           closedAt: new Date(),
@@ -310,7 +329,7 @@ async function claim(
 ): Promise<Policy | null> {
   await db
     .insert(cycles)
-    .values({ id: cycleId, tenantId, settlementGroup: group })
+    .values({ id: cycleId, tenantId, kind: 'settlement', settlementGroup: group })
     .onConflictDoNothing();
   const eligible = await db
     .select({ o: obligations, snapshot: deals.policySnapshot })
@@ -380,43 +399,25 @@ const roundState = async (db: Tx, run: RoundKey) =>
 type RoundKey = Pick<CycleRun, 'tenantId' | 'cycleId' | 'group'>;
 
 async function positionsOf(db: Tx, run: RoundKey, rows: NettedRow[]) {
-  const { ledger } = deps();
   const mode = parseGroup(run.group).netting as NettingMode;
-
-  const items: NettableObligation[] = [];
-  const collateral: FxCollateral[] = [];
-  for (const { o, d } of rows) {
-    let prefunded = 0n;
-    if (o.leg === 'principal') {
-      const currency = escrowCurrency(d);
-      const held = await ledger.balance(db, run.tenantId, Accounts.dealEscrow(o.dealId, currency));
-      if (currency === o.currency) prefunded = minBig(held, o.amount);
-      else if (held > 0n) collateral.push({ member: o.payerMemberId, currency, amount: held });
-    }
-    items.push({
-      id: o.id,
-      payer: o.payerMemberId,
-      payee: o.payeeMemberId,
-      currency: o.currency,
-      amount: o.amount,
-      prefunded,
-    });
-  }
+  const { items, collateral } = await nettingInput(db, run.tenantId, rows);
   const result = net(items, mode);
 
+  const settled = await deps().ledger.balances(db, run.tenantId, {
+    cycleId: run.cycleId,
+    kinds: ['settlement'],
+  });
+  const already = new Map(settled.map((b) => [b.code, b.balance]));
   const debts: Debt[] = [];
   for (const p of result.positions) {
     if (p.collect === 0n) continue;
-    const already = await ledger.balance(
-      db,
-      run.tenantId,
-      Accounts.cycleSettlement(run.cycleId, p.member, p.currency),
-    );
-    if (p.collect > already) {
+    const collected =
+      already.get(Accounts.cycleSettlement(run.cycleId, p.member, p.currency).code) ?? 0n;
+    if (p.collect > collected) {
       debts.push({
         member: p.member,
         currency: p.currency,
-        amount: p.collect - already,
+        amount: p.collect - collected,
         target: p.collect,
       });
     }
@@ -705,14 +706,18 @@ async function executeConversion(
   }
 }
 
-/** Move each member's foreign collateral into the currency it owes, through the house's FX position. */
+/**
+ * Move each member's foreign collateral into the currency it owes, through the house's FX position.
+ * Each exchange is one ledger batch: the sales out of the member's deal escrows and the purchase
+ * into its cycle position, so a reader pairs the two sides by batch.
+ */
 async function applyExchanges(db: Tx, run: CycleRun, attempt: number, exchanges: MemberExchange[]) {
   const { ledger } = deps();
   const { tenantId, cycleId } = run;
   const rows = (await nettedRows(db, cycleId)).filter(({ o }) => o.leg === 'principal');
 
-  const transfers: TransferInput[] = [];
   for (const e of exchanges) {
+    const transfers: TransferInput[] = [];
     let left = e.sellAmount;
     for (const { o, d } of rows) {
       if (left === 0n) break;
@@ -738,8 +743,8 @@ async function applyExchanges(db: Tx, run: CycleRun, attempt: number, exchanges:
       kind: 'fx_member_buy',
       ref: cycleId,
     });
+    await ledger.post(db, tenantId, transfers);
   }
-  await ledger.post(db, tenantId, transfers);
 }
 
 // ── Funding net debtors ────────────────────────────────────────────────────
@@ -1049,9 +1054,7 @@ async function defaultFundDraws(
   owed: bigint,
 ): Promise<{ transfers: TransferInput[]; short: bigint }> {
   const { tenantId, cycleId } = run;
-  const funds = (await memberHoldings(db, tenantId, 'default_fund')).filter(
-    (f) => f.currency === debt.currency,
-  );
+  const funds = await memberHoldings(db, tenantId, 'default_fund', { currency: debt.currency });
   const own = funds.filter((f) => f.memberId === debt.member);
   const others = funds.filter((f) => f.memberId !== debt.member);
   const pool = others.reduce((acc, f) => acc + f.amount, 0n);
@@ -1078,14 +1081,28 @@ async function defaultFundDraws(
   return { transfers, short };
 }
 
-const suspendMembers = (db: Tx, run: CycleRun, ids: string[]) =>
-  db
+async function suspendMembers(db: Tx, run: CycleRun, ids: string[]) {
+  if (!ids.length) return;
+  await db
     .update(members)
     .set({ status: 'suspended' })
     .where(and(eq(members.tenantId, run.tenantId), inArray(members.id, ids)));
+  for (const memberId of ids) {
+    await recordControl(db, run.tenantId, SYSTEM, {
+      type: 'member_suspended',
+      reason: 'Did not fund a settlement cycle',
+      payload: { memberId, cycleId: run.cycleId },
+    });
+  }
+}
 
 /** Send a cycle's obligations back to the queue, a whole deal at a time. */
-async function requeue(db: Tx, cycleId: string, event: string, onlyMembers?: string[]) {
+async function requeue(
+  db: Tx,
+  cycleId: string,
+  event: 'cycle_failed' | 'deferred_by_default' | 'deferred_by_decision',
+  onlyMembers?: string[],
+) {
   const rows = await db
     .select({ dealId: obligations.dealId })
     .from(obligations)
@@ -1113,9 +1130,9 @@ async function requeue(db: Tx, cycleId: string, event: string, onlyMembers?: str
 
 /** Each member's position in a cycle. These accounts exist only for that cycle. */
 async function cyclePositions(db: Tx, tenantId: string, cycleId: string) {
-  const accounts = await deps().ledger.balances(db, tenantId, `cycle:${cycleId}:`);
+  const accounts = await deps().ledger.balances(db, tenantId, { cycleId, kinds: ['settlement'] });
   return accounts.map((a) => ({
-    memberId: a.code.split(':')[2] as string,
+    memberId: a.memberId as string,
     currency: a.currency,
     balance: a.balance,
   }));
@@ -1157,9 +1174,53 @@ async function deferCycle(db: Tx, run: CycleRun) {
 
 /** All funding is in, so novate the obligations and read what is owed straight from the ledger. */
 async function commit(db: Tx, run: CycleRun) {
-  const { ledger } = deps();
   const { tenantId, cycleId } = run;
   const rows = await nettedRows(db, cycleId);
+  // Novation and fees are sized from balances they then move, so they post only with the status
+  // flip that claims them: a commit run again posts nothing twice.
+  const [claimed] = await db
+    .update(cycles)
+    .set({ status: 'committed' })
+    .where(and(eq(cycles.id, cycleId), eq(cycles.status, 'settling')))
+    .returning({ id: cycles.id });
+  if (claimed) {
+    await novate(db, run, rows);
+    await chargeFees(db, run, rows);
+  }
+
+  const walletMembers = new Set(
+    (
+      await db
+        .select({ id: members.id, attributes: members.attributes })
+        .from(members)
+        .where(eq(members.tenantId, tenantId))
+    )
+      .filter((m) => (m.attributes as { payout?: string }).payout === 'wallet')
+      .map((m) => m.id),
+  );
+
+  const instructions: Instruction[] = [];
+  // Read from the ledger, so a member collected in an earlier round and later excluded is repaid.
+  for (const { memberId, currency, balance } of await cyclePositions(db, tenantId, cycleId)) {
+    if (balance <= 0n) continue;
+    instructions.push(
+      await openInstruction(db, run, {
+        memberId,
+        currency,
+        direction: 'payout',
+        amount: balance,
+        rail: walletMembers.has(memberId) ? WALLET_RAIL : run.rail.name,
+        attempt: 0,
+      }),
+    );
+  }
+  return { count: rows.length, instructions };
+}
+
+/** Each obligation moves from its payer's settlement account to its payee's, through the house. */
+async function novate(db: Tx, run: CycleRun, rows: { o: Obligation; d: DealRow }[]) {
+  const { ledger } = deps();
+  const { tenantId, cycleId } = run;
   const transfers: TransferInput[] = [];
 
   for (const { o, d } of rows) {
@@ -1211,35 +1272,78 @@ async function commit(db: Tx, run: CycleRun) {
     });
   }
   if (transfers.length) await ledger.post(db, tenantId, transfers);
-  await db.update(cycles).set({ status: 'committed' }).where(eq(cycles.id, cycleId));
+}
 
-  const walletMembers = new Set(
-    (
-      await db
-        .select({ id: members.id, attributes: members.attributes })
-        .from(members)
-        .where(eq(members.tenantId, tenantId))
-    )
-      .filter((m) => (m.attributes as { payout?: string }).payout === 'wallet')
-      .map((m) => m.id),
-  );
+/**
+ * The program's platform fees on the deals a cycle settles, split between platform and house
+ * revenue by each program's `platformShareBps`. Each side pays from what the cycle is about to pay
+ * it, then from its wallet, and owes the house the rest. Fees are worked out in memory against a
+ * running balance per member and currency, then posted as one batch. Only the commit that claims
+ * the cycle charges them.
+ */
+async function chargeFees(db: Tx, run: CycleRun, rows: { o: Obligation; d: DealRow }[]) {
+  const charges = rows.flatMap(({ o, d }) => {
+    const fees = snapshotOf(d).resolved.policy.fees;
+    if (o.leg !== 'principal' || !fees) return [];
+    return [
+      { side: 'seller', memberId: o.payeeMemberId, bps: fees.sellerBps },
+      { side: 'buyer', memberId: o.payerMemberId, bps: fees.buyerBps },
+    ]
+      .map((s) => ({ ...s, o, share: fees.platformShareBps, fee: applyBps(o.amount, s.bps) }))
+      .filter((c) => c.fee > 0n);
+  });
+  if (!charges.length) return;
+  const { ledger } = deps();
+  const memberIds = [...new Set(charges.map((c) => c.memberId))];
+  const [inCycle, wallets] = await Promise.all([
+    ledger.balances(db, run.tenantId, { cycleId: run.cycleId, kinds: ['settlement'], memberIds }),
+    ledger.balances(db, run.tenantId, { kinds: ['available'], memberIds }),
+  ]);
+  // What is left to take from each account, after the fees already worked out.
+  const left = new Map([...inCycle, ...wallets].map((b) => [b.code, maxBig(b.balance, 0n)]));
+  const take = (account: AccountSpec, wanted: bigint) => {
+    const amount = minBig(left.get(account.code) ?? 0n, wanted);
+    left.set(account.code, (left.get(account.code) ?? 0n) - amount);
+    return amount;
+  };
 
-  const instructions: Instruction[] = [];
-  // Read from the ledger, so a member collected in an earlier round and later excluded is repaid.
-  for (const { memberId, currency, balance } of await cyclePositions(db, tenantId, cycleId)) {
-    if (balance <= 0n) continue;
-    instructions.push(
-      await openInstruction(db, run, {
-        memberId,
-        currency,
-        direction: 'payout',
-        amount: balance,
-        rail: walletMembers.has(memberId) ? WALLET_RAIL : run.rail.name,
-        attempt: 0,
-      }),
-    );
+  const entries: TransferInput[] = [];
+  for (const { side, memberId, o, share, fee } of charges) {
+    const settlement = Accounts.cycleSettlement(run.cycleId, memberId, o.currency);
+    const wallet = Accounts.memberAvailable(memberId, o.currency);
+    const fromCycle = take(settlement, fee);
+    const fromWallet = take(wallet, fee - fromCycle);
+    const owed = fee - fromCycle - fromWallet;
+    const key = `cycle:${run.cycleId}:obligation:${o.id}:fee:${side}`;
+    const parts: [string, AccountSpec, bigint, boolean][] = [
+      [key, settlement, fromCycle, false],
+      [`${key}:wallet`, wallet, fromWallet, false],
+      [`${key}:debt`, Accounts.memberDebt(memberId, o.currency), owed, true],
+    ];
+    // Each part is split between the platform and the house, so collected and owed stay apart.
+    for (const [k, debit, amount, isOwed] of parts) {
+      const platform = (amount * BigInt(share)) / 10_000n;
+      entries.push(
+        ...[
+          {
+            key: k,
+            credit: Accounts.houseFeeRevenue(o.currency),
+            amount: amount - platform,
+            kind: programFeeKind('house', isOwed),
+          },
+          {
+            key: `${k}:platform`,
+            credit: Accounts.platformFeeRevenue(o.currency),
+            amount: platform,
+            kind: programFeeKind('platform', isOwed),
+          },
+        ]
+          .filter((e) => e.amount > 0n)
+          .map((e) => ({ ...e, debit, ref: o.dealId })),
+      );
+    }
   }
-  return { count: rows.length, instructions };
+  await ledger.post(db, run.tenantId, entries);
 }
 
 async function openInstruction(
@@ -1314,18 +1418,34 @@ async function payOut(run: PayoutRun, first: Instruction) {
     );
     if (!wantsRetry(decision, attempt)) {
       // The house still owes this money, so it stays with the member as a balance they can withdraw.
-      await tx('payout_to_wallet', (db) =>
-        deps().ledger.post(db, tenantId, [
+      await tx('payout_to_wallet', async (db) => {
+        await deps().ledger.post(db, tenantId, [
           {
             key: `instruction:${current.id}:fallback`,
+            instructionId: current.id,
             debit: Accounts.cycleSettlement(run.cycleId, current.memberId, current.currency),
             credit: Accounts.memberAvailable(current.memberId, current.currency),
             amount: current.amount,
             kind: 'payout_fallback_wallet',
             ref: run.cycleId,
           },
-        ]),
-      );
+        ]);
+        await db
+          .update(settlementInstructions)
+          .set({ returnedToWalletAt: new Date() })
+          .where(eq(settlementInstructions.id, current.id));
+      });
+      await notify({
+        type: 'payment_reduced',
+        tenantId,
+        memberId: current.memberId,
+        cycleId: run.cycleId,
+        currency: current.currency,
+        expected: current.amount.toString(),
+        amount: '0',
+        status: 'held',
+        reason: `The payout could not be sent (${result.reason ?? 'unknown'}), so it is in the wallet`,
+      });
       return;
     }
     ins = await tx('payout_retry', (db) =>
@@ -1366,7 +1486,7 @@ async function executeOnRail(run: PayoutRun, ins: Instruction): Promise<RailResu
     } catch (err) {
       if (isWorkflowControl(err)) throw err;
       if ((await DBOS.now()) > confirmBy) await flagInDoubt(ins);
-      await DBOS.sleep(Math.min(300_000, 5_000 * 2 ** i));
+      await DBOS.sleep(paced(Math.min(300_000, 5_000 * 2 ** i)));
     }
   }
   if (result.status !== 'submitted') return result;
@@ -1410,6 +1530,7 @@ const reservation = (ins: Instruction): TransferInput => ({
   amount: ins.amount,
   kind: 'payout_reserve',
   ref: ins.cycleId,
+  instructionId: ins.id,
 });
 
 const releaseReservation = (ins: Instruction): TransferInput => ({
@@ -1419,11 +1540,17 @@ const releaseReservation = (ins: Instruction): TransferInput => ({
   amount: ins.amount,
   kind: 'payout_release',
   ref: ins.cycleId,
+  instructionId: ins.id,
 });
 
 function settlementTransfer(ins: Instruction): TransferInput {
   const settlement = Accounts.cycleSettlement(ins.cycleId, ins.memberId, ins.currency);
-  const base = { key: `instruction:${ins.id}`, amount: ins.amount, ref: ins.cycleId };
+  const base = {
+    key: `instruction:${ins.id}`,
+    amount: ins.amount,
+    ref: ins.cycleId,
+    instructionId: ins.id,
+  };
   if (ins.direction === 'collect') {
     const cash = Accounts.houseCash(ins.rail, ins.currency);
     return { ...base, debit: cash, credit: settlement, kind: 'collection' };
@@ -1492,25 +1619,95 @@ export interface WithdrawalRequest {
   memberId: string;
   currency: string;
   amount: bigint;
+  /** Who asked. Kept on the withdrawal's cycle and in its `withdrawal_requested` control event. */
+  requestedBy: ControlActor;
 }
+
+/** Why a withdrawal was not opened, as an error code a caller can act on and words for a person. */
+export interface WithdrawalRefusal {
+  code: 'settlement_held' | 'rail_held' | 'insufficient_funds' | 'debt_outstanding';
+  message: string;
+}
+
+/** What `runWithdrawal` announces once it has opened the withdrawal or refused it. */
+export interface WithdrawalOpened {
+  refusal?: WithdrawalRefusal;
+}
+
+const refuse = (code: WithdrawalRefusal['code'], message: string): WithdrawalRefusal => ({
+  code,
+  message,
+});
+
+const isRefusal = (opened: Instruction | WithdrawalRefusal): opened is WithdrawalRefusal =>
+  'code' in opened;
 
 /** Take the money from the wallet, or say why not. Owing anything comes before taking money out. */
 async function openWithdrawal(
   db: Tx,
   run: PayoutRun,
-  { memberId, currency, amount }: WithdrawalRequest,
-): Promise<Instruction | string> {
+  request: WithdrawalRequest,
+): Promise<Instruction | WithdrawalRefusal> {
+  const opened = await withdrawalOrRefusal(db, run, request);
+  const refused = isRefusal(opened);
+  await recordControl(db, run.tenantId, request.requestedBy, {
+    type: 'withdrawal_requested',
+    reason: refused ? opened.message : null,
+    payload: {
+      withdrawalId: run.cycleId,
+      memberId: request.memberId,
+      currency: request.currency,
+      amount: request.amount,
+      rail: run.rail.name,
+      status: refused ? 'refused' : 'opened',
+    },
+  });
+  return opened;
+}
+
+/**
+ * Why a withdrawal could not open now, if anything. A held withdrawal is checked again when it is
+ * approved, so an approval that could not run leaves the request open.
+ */
+export async function withdrawalRefusal(
+  db: Tx,
+  tenantId: string,
+  railName: string,
+  { memberId, currency, amount }: Pick<WithdrawalRequest, 'memberId' | 'currency' | 'amount'>,
+): Promise<WithdrawalRefusal | null> {
   const { ledger } = deps();
-  const { tenantId, cycleId } = run;
+  const [tenant] = await db.select().from(tenants).where(eq(tenants.id, tenantId));
+  if (tenant?.settlementHaltedAt) return refuse('settlement_held', 'settlement is stopped');
+  const held = await railBreakHold(db, tenantId, railName);
+  if (held) return refuse('rail_held', held);
   const member = await getMember(db, memberId);
-  if (member.status !== 'active') return `member is ${member.status}`;
+  if (member.status !== 'active') return refuse('settlement_held', `member is ${member.status}`);
   const [call] = await db
     .select({ id: marginCalls.id })
     .from(marginCalls)
     .where(and(eq(marginCalls.memberId, memberId), eq(marginCalls.status, 'open')));
-  if (call) return 'a margin call is open';
+  if (call) return refuse('debt_outstanding', 'a margin call is open');
   const debt = await ledger.balance(db, tenantId, Accounts.memberDebt(memberId, currency));
-  if (debt < 0n) return 'the member owes the house money in this currency';
+  if (debt < 0n) {
+    return refuse('debt_outstanding', 'the member owes the house money in this currency');
+  }
+  const available = await ledger.balance(
+    db,
+    tenantId,
+    Accounts.memberAvailable(memberId, currency),
+  );
+  return available < amount ? refuse('insufficient_funds', 'not enough available') : null;
+}
+
+async function withdrawalOrRefusal(
+  db: Tx,
+  run: PayoutRun,
+  request: WithdrawalRequest,
+): Promise<Instruction | WithdrawalRefusal> {
+  const { memberId, currency, amount, requestedBy } = request;
+  const { tenantId, cycleId } = run;
+  const refused = await withdrawalRefusal(db, tenantId, run.rail.name, request);
+  if (refused) return refused;
 
   const taken = await tryPost(db, tenantId, [
     {
@@ -1522,10 +1719,14 @@ async function openWithdrawal(
       ref: cycleId,
     },
   ]);
-  if (!taken) return 'not enough available';
-  await db
-    .insert(cycles)
-    .values({ id: cycleId, tenantId, settlementGroup: 'withdrawal', status: 'committed' });
+  if (!taken) return refuse('insufficient_funds', 'not enough available');
+  await db.insert(cycles).values({
+    id: cycleId,
+    tenantId,
+    kind: 'withdrawal',
+    status: 'committed',
+    requestedBy,
+  });
   return openInstruction(db, run, {
     memberId,
     currency,
@@ -1553,9 +1754,11 @@ async function runWithdrawal(
     }));
     const run: PayoutRun = { tenantId, cycleId, rail: deps().rails.get(railName), policy };
     const opened = await tx('withdrawal_open', (db) => openWithdrawal(db, run, request));
-    const refused = typeof opened === 'string' ? opened : undefined;
-    await DBOS.setEvent(WITHDRAWAL_OPENED, { refused });
-    if (typeof opened === 'string') return;
+    if (isRefusal(opened)) {
+      await DBOS.setEvent<WithdrawalOpened>(WITHDRAWAL_OPENED, { refusal: opened });
+      return;
+    }
+    await DBOS.setEvent<WithdrawalOpened>(WITHDRAWAL_OPENED, {});
     await payOut(run, opened);
     await tx('withdrawal_close', (db) => closeCycle(db, run, {}, 'settled', []));
   } catch (err) {

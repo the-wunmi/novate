@@ -84,6 +84,30 @@ export interface MetalAttemptStore {
   totalFees(): Promise<bigint>;
 }
 
+/** Attempts kept in memory, where nothing has to survive a restart: tests and one-off transfers. */
+export class MemoryMetalAttempts implements MetalAttemptStore {
+  rows: MetalAttempt[] = [];
+  fees = new Map<string, bigint>();
+  async find(key: string) {
+    return this.rows.find((r) => r.idempotencyKey === key);
+  }
+  async findByHash(hash: string) {
+    return this.rows.find((r) => r.txHash === hash);
+  }
+  async save(a: MetalAttempt) {
+    this.rows.push(a);
+  }
+  async discard(hash: string) {
+    this.rows = this.rows.filter((r) => r.txHash !== hash);
+  }
+  async recordFee(hash: string, fee: bigint) {
+    this.fees.set(hash, fee);
+  }
+  async totalFees() {
+    return [...this.fees.values()].reduce((a, b) => a + b, 0n);
+  }
+}
+
 /** Metal answered and will not take this transaction. Nothing was sent. */
 export class MetalRefusal extends Error {}
 
@@ -97,6 +121,8 @@ const same = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
  */
 export class MetalRail implements SettlementRail {
   readonly name = 'metal';
+  /** novate is wired to Metal's testnet; the client refuses a chain it was not set up for. */
+  readonly environment = 'testnet' as const;
   readonly capabilities: RailCapabilities = {
     pull: false,
     pullToLock: false,

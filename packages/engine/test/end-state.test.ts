@@ -10,12 +10,22 @@ import {
   ingestRailEvent,
   publishProgram,
   runCycle,
-  runReconciliation,
-  setMemberRailRefs,
   submitDocument,
   submitFact,
 } from '../src/index.ts';
-import { boot, brain, eur, gbp, makeWorld, notified, shutdown, waitFor } from './harness.ts';
+import {
+  assignRailRefs,
+  boot,
+  brain,
+  eur,
+  gbp,
+  makeWorld,
+  netProgram,
+  notified,
+  reconcile,
+  shutdown,
+  waitFor,
+} from './harness.ts';
 
 /**
  * The end state, with a stand-in for Airwallex: every rail call, webhook and agent goes through the
@@ -94,16 +104,14 @@ const trade: ProgramSpecInput = {
   decisions: { ceiling: { EUR: 20_000_000 } },
   settlement: { netting: 'multilateral', rail: 'airwallex', confirmWithin: '1h' },
 };
-const netted: ProgramSpecInput = {
-  ...presetInputs.netSettlement,
-  overrides: [],
+const netted = netProgram({
   settlement: {
     netting: 'multilateral',
     rail: 'airwallex',
     fundingWindow: '30s',
     confirmWithin: '1h',
   },
-};
+});
 
 const webhook = async (name: string, object: Record<string, unknown>) => {
   const body = JSON.stringify({
@@ -131,13 +139,15 @@ afterAll(() => clearInterval(paying));
 
 describe('end state', () => {
   it('runs the mug scenario unattended, then net settlement under a different program', async () => {
-    const before = notified.length;
+    // Members hear when a payment is held for review. Nobody at the house should be asked anything.
+    const operatorNotices = () => notified.filter((n) => n.type !== 'payment_reduced').length;
+    const before = operatorNotices();
     const w = await makeWorld(rail as never, { 'trade-assurance': trade });
     const accounts: Record<string, string> = {};
     for (const m of [w.brand, w.supplier, w.retailer]) {
       accounts[m] = `ga-${m}`;
-      await setMemberRailRefs(w.tenantId, m, {
-        airwallex_deposit_account: accounts[m],
+      await assignRailRefs(w, m, {
+        airwallex_deposit_account: accounts[m] as string,
         airwallex_beneficiary: `ben-${m}`,
       });
     }
@@ -232,7 +242,7 @@ describe('end state', () => {
     expect(await w.available(w.brand, 'GBP')).toBe(gbp('15000') - sold);
 
     // 5. The ledger agrees with what the rail holds. No request ids over Airwallex's limits.
-    const recon = await runReconciliation(w.tenantId, 'airwallex');
+    const recon = await reconcile(w.tenantId, 'airwallex');
     expect(recon.breaks).toEqual([]);
     for (const c of fake.calls) {
       const id = (c.body as { request_id?: string } | undefined)?.request_id;
@@ -240,7 +250,7 @@ describe('end state', () => {
     }
 
     // 6. Switch programs. Same tenant, same agents, same risk brain, no prefunding.
-    await publishProgram(w.tenantId, { key: 'net', spec: netted });
+    await publishProgram(w.tenantId, w.platform, { key: 'net', spec: netted });
     const nBuy = await w.deal({
       program: 'net',
       buyer: 'retailer',
@@ -280,10 +290,10 @@ describe('end state', () => {
     await waitFor(nSell.id, ['settled']);
     expect((await dealDetail(nBuy.id, w.platform)).deal.fundingCurrency).toBe('EUR');
 
-    expect(await runReconciliation(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
+    expect(await reconcile(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
 
     // Nobody was asked about anything, and the model saw exactly the exceptions.
-    expect(notified.length).toBe(before);
+    expect(operatorNotices()).toBe(before);
     expect(decisions).toEqual(['frozen', 'held']);
   });
 });

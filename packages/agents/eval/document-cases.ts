@@ -177,7 +177,7 @@ Ceramic mugs, packed in 40 cartons
 Gross weight: 420 kg`,
     fields: {},
   },
-  // Written after the prompt was last changed, as a check that the score is not tuned to the rest.
+  // Held out from prompt tuning, as a check that the score is not tuned to the rest.
   {
     id: 'doc/holdout-lading-pallets-and-containers',
     documentType: 'bill_of_lading',

@@ -1,5 +1,6 @@
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
-import { type Currency, minorUnits, toMajor } from '@novate/core';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { type Currency, DomainError, minorUnits, toMajor } from '@novate/core';
 import type {
   CardAcceptance,
   CardResult,
@@ -18,6 +19,7 @@ import type {
   RailTransaction,
   SettlementRail,
 } from './index.ts';
+import { depositDetailsOf, provisionRefs } from './refs.ts';
 
 export interface AirwallexConfig {
   clientId: string;
@@ -28,7 +30,7 @@ export interface AirwallexConfig {
   baseUrl?: string;
   /** Pinned so a change to Airwallex's default version cannot change behaviour. */
   apiVersion?: string;
-  /** Transfer `reason` sent to Airwallex. */
+  /** `reason` on payouts to a bank. Defaults to `goods_purchased`. */
   transferReason?: string;
   /** `pooled`: one account, ledger says whose. `connected`: each member is a connected account. */
   custody?: 'pooled' | 'connected';
@@ -119,7 +121,9 @@ interface ConversionBody {
  */
 export class AirwallexRail implements SettlementRail {
   readonly name = 'airwallex';
+  readonly environment: 'live' | 'sandbox';
   readonly capabilities: RailCapabilities;
+  readonly provisionNeeds: 'beneficiary' | 'connectedAccount';
   readonly #fetch: typeof fetch;
   readonly #base: string;
   readonly #connected: boolean;
@@ -129,7 +133,9 @@ export class AirwallexRail implements SettlementRail {
   constructor(private readonly config: AirwallexConfig) {
     this.#fetch = config.fetch ?? fetch;
     this.#base = config.baseUrl ?? AIRWALLEX_SANDBOX;
+    this.environment = this.#base.includes('sandbox') ? 'sandbox' : 'live';
     this.#connected = config.custody === 'connected';
+    this.provisionNeeds = this.#connected ? 'connectedAccount' : 'beneficiary';
     this.capabilities = {
       pull: this.#connected,
       pullToLock: this.#connected,
@@ -190,7 +196,7 @@ export class AirwallexRail implements SettlementRail {
     return parsed as T;
   }
 
-  // ── Money out ────────────────────────────────────────────────────────────
+  // ── Payments ─────────────────────────────────────────────────────────────
 
   async collect(req: RailRequest): Promise<RailResult> {
     if (!this.#connected) {
@@ -339,7 +345,7 @@ export class AirwallexRail implements SettlementRail {
     );
   }
 
-  // ── Truth ────────────────────────────────────────────────────────────────
+  // ── Reconciliation ───────────────────────────────────────────────────────
 
   async balances(): Promise<RailBalance[]> {
     type Row = { currency: Currency; total_amount: string | number; account_type?: string };
@@ -506,11 +512,16 @@ export class AirwallexRail implements SettlementRail {
       beneficiary: input.beneficiary,
       transfer_methods: input.transferMethods,
     });
-    return { airwallex_deposit_account: account.id, airwallex_beneficiary: beneficiary.id };
+    return provisionRefs(this.name, {
+      depositAccount: account.id,
+      details: depositDetailsOf(account, input.currency),
+      beneficiary: beneficiary.id,
+      payee: input.beneficiary,
+    });
   }
 
   /** Airwallex refuses a repeated request id, so a retry finds the account the first try made. */
-  async #globalAccount(input: ProvisionInput): Promise<{ id: string }> {
+  async #globalAccount(input: ProvisionInput): Promise<{ id: string } & Record<string, unknown>> {
     try {
       return await this.#call('POST', '/api/v1/global_accounts/create', {
         request_id: input.requestId,
@@ -521,12 +532,18 @@ export class AirwallexRail implements SettlementRail {
         ],
       });
     } catch (err) {
+      // Airwallex caps Global Accounts per currency and country, and closed ones still count.
+      if (err instanceof AirwallexError && err.code === 'NO_MORE_VBA_ALLOWED') {
+        throw new DomainError(
+          'rail_refused',
+          `Airwallex will not open more ${input.currency} accounts in ${input.countryCode} on this account`,
+        );
+      }
       if (!(err instanceof AirwallexError && err.code === 'DUPLICATED_REQUEST')) throw err;
       const query = new URLSearchParams({ nick_name: input.nickName, page_size: '100' });
-      const { items } = await this.#call<{ items: { id: string; request_id: string }[] }>(
-        'GET',
-        `/api/v1/global_accounts?${query}`,
-      );
+      const { items } = await this.#call<{
+        items: ({ id: string; request_id: string } & Record<string, unknown>)[];
+      }>('GET', `/api/v1/global_accounts?${query}`);
       const made = items.find((a) => a.request_id === input.requestId);
       if (!made) throw err;
       return made;
@@ -557,7 +574,7 @@ export class AirwallexRail implements SettlementRail {
       await this.#call('POST', `/api/v1/accounts/${id}/submit`, {});
       for (let i = 0; i < SUBMIT_POLLS && status === 'CREATED'; i++) {
         status = await this.#accountStatus(id);
-        if (status === 'CREATED') await new Promise((done) => setTimeout(done, SUBMIT_POLL_MS));
+        if (status === 'CREATED') await sleep(SUBMIT_POLL_MS);
       }
     }
     if (this.#base === AIRWALLEX_SANDBOX && status === 'SUBMITTED') {

@@ -18,7 +18,6 @@ export interface Money {
 /** Far above any real payment, and low enough that totals cannot overflow a Postgres bigint. */
 export const MAX_MINOR = 1_000_000_000_000_000n;
 
-/** Accepts bigint, an integer, or a numeric string of minor units (e.g. "1400000" = €14,000.00). */
 /**
  * Whole minor units. Code can pass a bigint, but the schema that agents read describes only what
  * JSON can carry, because JSON Schema has no bigint.

@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { zodOutputFormat } from '@anthropic-ai/sdk/helpers/zod';
+import type { RecordMetadata } from '@novate/core';
 import type { z } from 'zod';
 
 export const DEFAULT_MODEL = 'claude-opus-5-5';
@@ -34,7 +35,6 @@ export type ModelContent =
 export interface ModelRequest {
   system: string;
   content: ModelContent[];
-  /** The shape the reply must have. */
   schema: z.ZodType;
   /** Only worth setting if the system prompt reaches the model's minimum cacheable length. */
   cacheSystem?: boolean;
@@ -42,7 +42,10 @@ export interface ModelRequest {
 
 export interface ModelReply {
   output: unknown;
-  metadata: Record<string, unknown>;
+  metadata: Pick<
+    RecordMetadata,
+    'model' | 'fellBack' | 'inputTokens' | 'outputTokens' | 'cacheReadTokens'
+  >;
 }
 
 /** The one thing agents need from a model. Small, so tests can replace it. */

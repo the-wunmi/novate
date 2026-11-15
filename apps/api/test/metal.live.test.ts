@@ -1,11 +1,13 @@
-import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { serve } from '@hono/node-server';
 import { createMetalPaymentClient } from '@metalntwx/metal-pay';
 import { runMigrations } from '@novate/db/migrate';
+import { freshDatabasePair } from '@novate/db/test-databases';
 import {
+  approveRequest,
   launchEngine,
   PostgresMetalAttempts,
+  pollRailsNow,
   revokeApiKey,
   runReconciliation,
   setMemberRailRefs,
@@ -16,21 +18,19 @@ import { createMetalClient, MetalRail, RailRegistry } from '@novate/rails';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.ts';
+import { fundStablecoinBuyer } from '../src/metal-buyer.ts';
 import { metalGateway } from '../src/x402.ts';
-
-const envFile = new URL('../../../.env', import.meta.url).pathname;
-if (existsSync(envFile)) process.loadEnvFile(envFile);
 
 const ADMIN = 'metal-live-admin';
 const PORT = 4199;
 
 /**
  * A real buyer wallet paying a real deal over x402 on Metal testnet, through Metal's facilitator, and
- * the seller paid on-chain. It runs as the default tenant of a dev server sharing this database,
- * because that server owns the rail and reads the finalized deposit. Needs NOVATE_LIVE=1 and
- * NOVATE_LIVE_BUYER_KEY, a testnet key holding at least US$1, funded before the rail's opening.
+ * the seller paid on-chain. It runs its own engine on fresh databases, so the default tenant owns the
+ * rail. The house wallet funds a throwaway buyer first, before novate records what the rail holds.
+ * Run by `pnpm test:live`; stop any dev server using the same Metal wallet first.
  */
-const live = process.env.NOVATE_LIVE === '1' && process.env.NOVATE_LIVE_BUYER_KEY;
+const live = Boolean(process.env.METAL_RPC_URL && process.env.METAL_PRIVATE_KEY);
 describe.skipIf(!live)('x402 on the Metal testnet (live)', () => {
   const client = createMetalClient({
     rpcUrl: process.env.METAL_RPC_URL as string,
@@ -44,15 +44,28 @@ describe.skipIf(!live)('x402 on the Metal testnet (live)', () => {
   let engine: Awaited<ReturnType<typeof launchEngine>>;
   let server: ReturnType<typeof serve>;
   let revoke: (() => Promise<void>) | undefined;
+  let buyerKey: `0x${string}`;
 
   beforeAll(async () => {
-    await runMigrations();
+    const { databaseUrl, systemDatabaseUrl } = await freshDatabasePair('novate_test_metal_live');
+    buyerKey = await fundStablecoinBuyer(client);
+    await runMigrations(databaseUrl);
     engine = await launchEngine({
+      databaseUrl,
+      systemDatabaseUrl,
+      auth: {
+        secretKey: randomBytes(32).toString('base64'),
+        publicUrl: `http://localhost:${PORT}`,
+      },
       appName: `novate-metal-live-${Date.now()}`,
       rails: new RailRegistry().register(rail),
+      ownedRails: [rail.name],
     });
+    // Nothing runs on a schedule here, so the test reads the chain itself. This first read starts
+    // following it, before the payment, or a deposit already final when polling began is skipped.
+    await pollRailsNow();
     server = serve({ fetch: app.fetch, port: PORT });
-  }, 120_000);
+  }, 300_000);
 
   afterAll(async () => {
     await revoke?.();
@@ -68,14 +81,15 @@ describe.skipIf(!live)('x402 on the Metal testnet (live)', () => {
     });
 
   it('takes a real payment, credits it after finality, and pays the seller', async () => {
-    const buyerAccount = privateKeyToAccount(process.env.NOVATE_LIVE_BUYER_KEY as `0x${string}`);
+    const buyerAccount = privateKeyToAccount(buyerKey);
     const sellerAddress = privateKeyToAccount(generatePrivateKey()).address;
 
     const setup = await engine.db.query.instanceSetup.findFirst();
     const tenantId = setup?.defaultTenantId as string;
-    const issued = await call(`/tenants/${tenantId}/platform-key`, ADMIN, {});
+    const issued = await call(`/operator/tenants/${tenantId}/platform-key`, ADMIN, {});
     const { id: keyId, key: apiKey } = (await issued.json()) as { id: string; key: string };
-    revoke = () => revokeApiKey(tenantId, keyId);
+    const house = { kind: 'house' as const, id: 'metal-live-test', tenantId };
+    revoke = () => revokeApiKey(tenantId, house, keyId);
     const member = async (name: string) =>
       (
         (await (
@@ -92,7 +106,16 @@ describe.skipIf(!live)('x402 on the Metal testnet (live)', () => {
       },
     });
     const [buyer, seller] = [await member('x402 live buyer'), await member('x402 live seller')];
-    await setMemberRailRefs(tenantId, seller, { metal_account: sellerAddress });
+    // Where a member is paid takes one house person to ask and another to approve.
+    const asker = { ...house, userId: randomUUID(), name: 'Live test asker' };
+    const checker = { ...house, userId: randomUUID(), name: 'Live test checker' };
+    const payee = await setMemberRailRefs(tenantId, asker, seller, {
+      refs: { metal_account: sellerAddress },
+      reason: 'Seller wallet for the live test',
+    });
+    if (payee.status === 'pending_approval') {
+      await approveRequest(tenantId, checker, payee.approvalId);
+    }
 
     const created = await call(`/tenants/${tenantId}/deals`, apiKey, {
       idempotencyKey: randomUUID(),
@@ -129,7 +152,11 @@ describe.skipIf(!live)('x402 on the Metal testnet (live)', () => {
     expect(paid.headers.get('payment-response')).toBeTruthy();
 
     // The money counts only once the deposit is final, and the buyer then accepts the goods.
-    await expect.poll(status, { timeout: 180_000, interval: 1_000 }).toBe('awaiting_conditions');
+    const finalized = async () => {
+      await pollRailsNow();
+      return status();
+    };
+    await expect.poll(finalized, { timeout: 180_000, interval: 1_000 }).toBe('awaiting_conditions');
     await submitFact(
       dealId,
       { kind: 'member', id: buyer, tenantId, memberId: buyer },

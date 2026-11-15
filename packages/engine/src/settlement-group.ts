@@ -23,9 +23,32 @@ export function settlementGroup(
   return `${s.rail}|${s.netting}|${timing}|${deal.programId}`;
 }
 
-export function parseGroup(group: string): { rail: string; netting: string; timing: string } {
-  const [rail, netting, timing] = group.split('|') as [string, string, string];
-  return { rail, netting, timing };
+export function parseGroup(group: string): {
+  rail: string;
+  netting: string;
+  timing: string;
+  programId: string;
+} {
+  const [rail, netting, timing, programId] = group.split('|') as [string, string, string, string];
+  return { rail, netting, timing, programId };
+}
+
+/**
+ * A settlement group as readers see it, so nothing outside this file takes the key apart: its
+ * rail, netting and timing. Null for a cycle that belongs to no group, such as a withdrawal.
+ */
+export function settlementOf(group: string | null) {
+  if (!group) return null;
+  const { rail, netting, timing } = parseGroup(group);
+  return {
+    rail,
+    netting,
+    timing: timing.startsWith('every:')
+      ? { mode: 'cycle' as const, every: timing.slice('every:'.length) }
+      : timing.startsWith('deal:')
+        ? { mode: 'immediate' as const, every: null }
+        : { mode: 'manual' as const, every: null },
+  };
 }
 
 /** A UUID derived from a string, so repeating a scheduled job cannot start it twice. */

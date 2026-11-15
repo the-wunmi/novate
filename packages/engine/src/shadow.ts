@@ -1,21 +1,31 @@
 import { DBOS } from '@dbos-inc/dbos-sdk';
 import { DomainError, parseInput } from '@novate/core';
-import { decisionCases, decisionOutcomes, shadowResults, shadowRuns } from '@novate/db';
 import {
-  ALLOWED_ACTIONS,
+  decisionCases,
+  decisionOutcomes,
+  type ShadowSummary,
+  shadowResults,
+  shadowRuns,
+} from '@novate/db';
+import {
+  type ActionCheck,
+  allowedActions,
   type CaseKind,
   CaseKind as CaseKindSchema,
   type CaseView,
+  type Claimant,
+  checkAction,
   type DecisionAgent,
   Decisions,
+  describeCheck,
   firstAccepted,
-  type Proposal,
-  validateAction,
+  refusalsOf,
 } from '@novate/policy';
 import { and, count, desc, eq, gte, inArray, lt, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { actionContext } from './decisions.ts';
-import { deps, isWorkflowControl, tx } from './deps.ts';
+import { deps, isWorkflowControl, paced, tx } from './deps.ts';
+import { decidedAction } from './repo.ts';
 
 export const ShadowCandidate = z
   .object({
@@ -50,10 +60,10 @@ interface Replayable {
   c: CaseRow;
   verdict: 'good' | 'bad' | 'neutral' | null;
 }
-type Answer = { action: string; rationale?: string; violations: string[] };
+/** What the candidate did with a case. `refused`: the failed checks of its last refused proposal. */
+type Answer = { action: string; rationale?: string; refused: ActionCheck[] };
 
 const usesModel = (c: ShadowCandidate) => Boolean(c.model || c.effort || c.instructions);
-const recordedAction = (c: CaseRow) => (c.resolution as { action: Proposal['action'] }).action;
 
 const viewOf = (c: CaseRow): CaseView => ({
   caseId: c.id,
@@ -61,7 +71,10 @@ const viewOf = (c: CaseRow): CaseView => ({
   reason: c.reason,
   bindingHash: c.bindingHash,
   shown: c.shown,
-  allowedActions: ALLOWED_ACTIONS[c.kind as CaseKind],
+  allowedActions: allowedActions(
+    c.kind as CaseKind,
+    (c.context as { claimant?: Claimant }).claimant,
+  ),
 });
 
 /** One case, through the same propose, check and retry loop as production. Nothing is applied. */
@@ -71,7 +84,7 @@ async function replay(
   agent: DecisionAgent | undefined,
 ): Promise<Answer> {
   const decider = { type: 'model' as const, id: 'shadow' };
-  let violations: string[] = [];
+  let refused: ActionCheck[] = [];
   const attempts = agent ? (candidate.decisions?.modelAttempts ?? 2) : 1;
   const accepted = await firstAccepted(
     attempts,
@@ -81,30 +94,21 @@ async function replay(
             name: 'shadow_model',
             retriesAllowed: true,
             maxAttempts: 3,
+            intervalSeconds: paced(1_000) / 1_000,
           })
-        : Promise.resolve({ action: recordedAction(c), rationale: 'recorded decision' }),
+        : Promise.resolve({ action: decidedAction(c), rationale: 'recorded decision' }),
     async (proposal) => {
-      violations = validateAction(
+      const checks = checkAction(
         actionContext(c, decider, proposal.action, candidate.decisions),
         proposal.action,
       );
-      return violations.length ? violations : proposal;
+      refused = checks.filter((check) => !check.passed);
+      return refused.length ? refusalsOf(refused) : proposal;
     },
   );
   return accepted
-    ? { action: accepted.action.type, rationale: accepted.rationale, violations: [] }
-    : { action: 'to_person', violations };
-}
-
-interface ShadowSummary {
-  replayed: number;
-  same: number;
-  changed: number;
-  toPerson: number;
-  /** The original went badly and the candidate would have done something else. */
-  wouldHaveFixed: number;
-  /** The original went well and the candidate would have done something else. */
-  wouldHaveChanged: number;
+    ? { action: accepted.action.type, rationale: accepted.rationale, refused: [] }
+    : { action: 'to_person', refused };
 }
 
 async function runShadow(
@@ -143,9 +147,9 @@ async function runShadow(
     for (const item of cases) {
       const answer = await replay(item, candidate, agent).catch((err: Error): Answer => {
         if (isWorkflowControl(err)) throw err;
-        return { action: 'error', rationale: err.message.slice(0, 500), violations: [] };
+        return { action: 'error', rationale: err.message.slice(0, 500), refused: [] };
       });
-      const recorded = recordedAction(item.c).type;
+      const recorded = decidedAction(item.c).type;
       const changed = answer.action !== recorded;
       summary.replayed++;
       if (!changed) summary.same++;
@@ -163,7 +167,7 @@ async function runShadow(
             candidate: answer.action,
             rationale: answer.rationale,
             verdict: item.verdict,
-            violations: answer.violations,
+            refused: answer.refused,
           })
           .onConflictDoNothing(),
       );
@@ -231,7 +235,13 @@ export async function shadowRunDetail(tenantId: string, runId: string) {
     .where(and(eq(shadowRuns.id, runId), eq(shadowRuns.tenantId, tenantId)));
   if (!run) throw new DomainError('not_found', 'Replay not found');
   const results = await db.select().from(shadowResults).where(eq(shadowResults.runId, runId));
-  return { run, results };
+  return {
+    run,
+    results: results.map((r) => ({
+      ...r,
+      refused: (r.refused as ActionCheck[]).map((c) => ({ ...c, text: describeCheck(c) })),
+    })),
+  };
 }
 
 /** A run saved just before a crash has no workflow, and would block every later run. */

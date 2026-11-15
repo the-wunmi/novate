@@ -20,17 +20,17 @@ export const presetInputs = {
         {
           when: 'signals.history.seller.completedDeals >= 3.0 && signals.history.seller.onTimeRate < 0.9',
           addBps: 500,
-          reason: 'seller has missed deliveries',
+          reason: 'the seller has missed deliveries',
         },
         {
           when: 'signals.history.seller.completedDeals >= 20.0 && signals.history.seller.onTimeRate >= 0.98',
           addBps: -300,
-          reason: 'seller has a long clean record',
+          reason: 'the seller has a long clean record',
         },
         {
           when: 'seller.homeCurrency != deal.currency && signals.fx.vol30d > 0.10',
           addBps: 200,
-          reason: 'volatile settlement currency for the seller',
+          reason: 'the seller is paid in another currency and 30-day FX volatility is above 10%',
         },
       ],
     },
@@ -133,12 +133,12 @@ export const presetInputs = {
         {
           when: 'signals.history.seller.completedDeals >= 3.0 && signals.history.seller.defectRate > 0.05',
           addBps: 500,
-          reason: 'seller has a high defect rate',
+          reason: 'the seller has a defect rate above 5%',
         },
         {
           when: 'signals.history.seller.completedDeals >= 20.0 && signals.history.seller.defectRate < 0.01',
           addBps: -300,
-          reason: 'seller has a long clean record',
+          reason: 'the seller has a long clean record',
         },
       ],
     },

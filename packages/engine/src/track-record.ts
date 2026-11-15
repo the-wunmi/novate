@@ -12,7 +12,7 @@ import {
   type Tx,
 } from '@novate/db';
 import {
-  type ActionType,
+  type Action,
   type CaseKind,
   confidentScore,
   type Decisions,
@@ -24,8 +24,9 @@ import {
   ProgramSpec,
   tallyRecord,
 } from '@novate/policy';
-import { and, asc, desc, eq, gt, gte, isNull, lte, ne, or, sql } from 'drizzle-orm';
+import { and, asc, desc, eq, gt, gte, inArray, isNull, lte, ne, or, sql } from 'drizzle-orm';
 import { deps } from './deps.ts';
+import { decidedAction } from './repo.ts';
 
 type CaseRow = typeof decisionCases.$inferSelect;
 type DealRow = typeof deals.$inferSelect;
@@ -37,11 +38,7 @@ const RESUBMIT_WINDOW_MS = 7 * 86_400_000;
 const AGENT_WATCH_MS = 7 * 86_400_000;
 const JUDGE_AGAIN_MS = 3_600_000;
 
-async function dealSignals(
-  db: Tx,
-  c: CaseRow,
-  action: Resolution['action'],
-): Promise<OutcomeSignals> {
+async function dealSignals(db: Tx, c: CaseRow, action: Action): Promise<OutcomeSignals> {
   const [deal] = await db
     .select()
     .from(deals)
@@ -59,8 +56,7 @@ async function dealSignals(
   const context = c.context as { evidence?: { currentBps?: number } };
   const raisedReserve =
     action.type === 'margin_call' ||
-    (action.type === 'resize_margin' &&
-      (action.bps as number) > (context.evidence?.currentBps ?? 0));
+    (action.type === 'resize_margin' && action.bps > (context.evidence?.currentBps ?? 0));
   return {
     subject: 'deal',
     status: open
@@ -165,12 +161,7 @@ async function agentSignals(db: Tx, c: CaseRow): Promise<OutcomeSignals> {
   return { subject: 'agent', matured, suspendedAgain: agent?.status === 'blocked' };
 }
 
-interface Resolution {
-  action: { type: ActionType; bps?: number };
-  decider: { type: string };
-}
-
-async function signalsFor(db: Tx, c: CaseRow, action: Resolution['action']) {
+async function signalsFor(db: Tx, c: CaseRow, action: Action) {
   if (c.dealId) return dealSignals(db, c, action);
   switch (c.subjectType) {
     case 'member':
@@ -193,15 +184,19 @@ async function signalsFor(db: Tx, c: CaseRow, action: Resolution['action']) {
 /** Look at model decisions old enough to judge, and record how each one turned out. */
 export async function judgeMaturedDecisions(db: Tx, tenantId: string): Promise<number> {
   const now = new Date();
+  // A decision about a deal can only be judged once the deal is over, so open deals are not looked
+  // at, and the first look after a deal closes judges it, with no wait left over from earlier.
   const pending = await db
     .select({ c: decisionCases })
     .from(decisionCases)
     .leftJoin(decisionOutcomes, eq(decisionOutcomes.caseId, decisionCases.id))
+    .leftJoin(deals, eq(deals.id, decisionCases.dealId))
     .where(
       and(
         eq(decisionCases.tenantId, tenantId),
         eq(decisionCases.status, 'decided'),
         isNull(decisionOutcomes.caseId),
+        or(isNull(decisionCases.dealId), inArray(deals.status, [...TERMINAL_DEAL_STATUSES])),
         or(isNull(decisionCases.judgeAfter), lte(decisionCases.judgeAfter, now)),
         sql`${decisionCases.resolution}->'decider'->>'type' = 'model'`,
       ),
@@ -210,7 +205,7 @@ export async function judgeMaturedDecisions(db: Tx, tenantId: string): Promise<n
     .limit(BATCH);
   let judged = 0;
   for (const { c } of pending) {
-    const { action } = c.resolution as unknown as Resolution;
+    const action = decidedAction(c);
     const signals = await signalsFor(db, c, action);
     const verdict = signals && judgeDecision(c.kind as CaseKind, action.type, signals);
     if (!verdict) {

@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { type Currency, DomainError } from '@novate/core';
 import { ledgerAccounts, ledgerTransfers, type Tx } from '@novate/db';
-import { and, eq, inArray, sql } from 'drizzle-orm';
-import type { AccountSpec } from './accounts.ts';
+import { type AnyColumn, and, eq, inArray, sql } from 'drizzle-orm';
+import type { AccountKind, AccountOwner, AccountSpec } from './accounts.ts';
 
 export interface TransferInput {
   /** Unique per tenant. Re-posting the same keys is a no-op, which makes retries safe. */
@@ -12,6 +12,8 @@ export interface TransferInput {
   amount: bigint;
   kind: string;
   ref?: string;
+  /** The settlement instruction this transfer carries out. */
+  instructionId?: string;
 }
 
 export interface PostResult {
@@ -22,11 +24,28 @@ export interface PostResult {
 
 export interface Balance {
   code: string;
+  kind: AccountKind;
+  memberId: string | null;
+  dealId: string | null;
+  cycleId: string | null;
+  rail: string | null;
   currency: Currency;
   debitsPosted: bigint;
   creditsPosted: bigint;
   /** Signed balance on the account's normal side. */
   balance: bigint;
+}
+
+/** Which accounts to read: every condition given must hold. */
+export interface AccountQuery extends AccountOwner {
+  kinds?: readonly AccountKind[];
+  /** Any of these deals. */
+  dealIds?: readonly string[];
+  /** Any of these members. */
+  memberIds?: readonly string[];
+  currency?: Currency;
+  /** Only accounts holding more than zero on their normal side. */
+  positive?: boolean;
 }
 
 /**
@@ -37,7 +56,7 @@ export interface Balance {
 export interface Ledger {
   post(tx: Tx, tenantId: string, transfers: TransferInput[]): Promise<PostResult>;
   balance(tx: Tx, tenantId: string, account: AccountSpec): Promise<bigint>;
-  balances(tx: Tx, tenantId: string, codePrefix: string): Promise<Balance[]>;
+  balances(tx: Tx, tenantId: string, query: AccountQuery): Promise<Balance[]>;
 }
 
 const OVERDRAFT_CONSTRAINT = 'ledger_accounts_overdraft';
@@ -97,6 +116,7 @@ export class PostgresLedger implements Ledger {
         amount: t.amount,
         kind: t.kind,
         ref: t.ref ?? null,
+        instructionId: t.instructionId ?? null,
       })),
     );
 
@@ -143,14 +163,30 @@ export class PostgresLedger implements Ledger {
     return toBalance(row).balance;
   }
 
-  async balances(tx: Tx, tenantId: string, codePrefix: string): Promise<Balance[]> {
+  async balances(tx: Tx, tenantId: string, query: AccountQuery): Promise<Balance[]> {
+    if (query.dealIds?.length === 0 || query.memberIds?.length === 0 || query.kinds?.length === 0) {
+      return [];
+    }
+    const a = ledgerAccounts;
+    const owned = (column: AnyColumn, value: string | undefined) =>
+      value === undefined ? undefined : eq(column, value);
     const rows = await tx
       .select()
-      .from(ledgerAccounts)
+      .from(a)
       .where(
         and(
-          eq(ledgerAccounts.tenantId, tenantId),
-          sql`${ledgerAccounts.code} LIKE ${`${codePrefix}%`}`,
+          eq(a.tenantId, tenantId),
+          owned(a.memberId, query.memberId),
+          owned(a.dealId, query.dealId),
+          owned(a.cycleId, query.cycleId),
+          owned(a.rail, query.rail),
+          owned(a.currency, query.currency),
+          query.kinds ? inArray(a.kind, [...query.kinds]) : undefined,
+          query.dealIds ? inArray(a.dealId, [...query.dealIds]) : undefined,
+          query.memberIds ? inArray(a.memberId, [...query.memberIds]) : undefined,
+          query.positive
+            ? sql`CASE WHEN ${a.normal} = 'credit' THEN ${a.creditsPosted} - ${a.debitsPosted} ELSE ${a.debitsPosted} - ${a.creditsPosted} END > 0`
+            : undefined,
         ),
       );
     return rows.map(toBalance);
@@ -167,6 +203,11 @@ export class PostgresLedger implements Ledger {
         specs.map((s) => ({
           tenantId,
           code: s.code,
+          kind: s.kind,
+          memberId: s.memberId ?? null,
+          dealId: s.dealId ?? null,
+          cycleId: s.cycleId ?? null,
+          rail: s.rail ?? null,
           currency: s.currency,
           normal: s.normal,
           noOverdraft: s.noOverdraft ? 1 : 0,
@@ -196,6 +237,11 @@ function toBalance(row: typeof ledgerAccounts.$inferSelect): Balance {
       : row.debitsPosted - row.creditsPosted;
   return {
     code: row.code,
+    kind: row.kind,
+    memberId: row.memberId,
+    dealId: row.dealId,
+    cycleId: row.cycleId,
+    rail: row.rail,
     currency: row.currency,
     debitsPosted: row.debitsPosted,
     creditsPosted: row.creditsPosted,

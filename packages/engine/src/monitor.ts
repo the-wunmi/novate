@@ -5,6 +5,8 @@ import { Accounts } from '@novate/ledger';
 import { type Decisions, durationMs } from '@novate/policy';
 import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, or } from 'drizzle-orm';
 import { resolveStuckCardPayments } from './card-funding.ts';
+import { recordControl, SYSTEM } from './control.ts';
+import { startApprovedWithdrawals } from './cycle-runs.ts';
 import { resolveForDeal, signalSubject } from './deal-policy.ts';
 import { dealWorkflow, type SettlementMessage } from './deal-workflow.ts';
 import { dealCase, resolveCase } from './decisions.ts';
@@ -78,6 +80,7 @@ async function monitorTenant(tenantId: string): Promise<MonitorSummary> {
     }
   }
   await restartStrandedDeals(tenantId);
+  await startApprovedWithdrawals(tenantId, STRANDED_AFTER_MS);
   await reapStrandedShadowRuns(tenantId);
   summary.decisionsJudged = await tx('monitor_judge', (db) => judgeMaturedDecisions(db, tenantId));
   await resolveStuckCardPayments(tenantId, new Date(await DBOS.now()));
@@ -242,7 +245,7 @@ async function topUpMargin(db: Tx, deal: DealRow, caseId: string, extra: bigint)
       ref: deal.id,
     },
   ]);
-  if (!paid) await record(db, deal.id, 'margin_call_failed', { extra });
+  if (!paid) await record(db, deal.id, 'margin_call_failed', { extra, currency });
   return paid;
 }
 
@@ -276,7 +279,13 @@ async function resizeMargin(db: Tx, deal: DealRow, caseId: string, bps: number):
     .update(deals)
     .set({ policySnapshot: next as unknown as Record<string, unknown> })
     .where(eq(deals.id, deal.id));
-  await record(db, deal.id, 'margin_resized', { from: currentBps, to: bps, posted, target });
+  await record(db, deal.id, 'margin_resized', {
+    from: currentBps,
+    to: bps,
+    posted,
+    target,
+    currency,
+  });
   return true;
 }
 
@@ -378,12 +387,18 @@ async function reviewAgent(tenantId: string, review: AgentReview, summary: Monit
   if (res.outcome !== 'decided') return;
   if (res.action.type !== 'suspend_agent' && res.action.type !== 'reinstate_agent') return;
   const status = res.action.type === 'suspend_agent' ? 'blocked' : 'active';
-  await tx('set_agent_status', (db) =>
-    db
+  const { caseId, decider } = res;
+  await tx('set_agent_status', async (db) => {
+    await db
       .update(agents)
       .set({ status })
-      .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId))),
-  );
+      .where(and(eq(agents.id, agentId), eq(agents.tenantId, tenantId)));
+    await recordControl(db, tenantId, SYSTEM, {
+      type: status === 'blocked' ? 'agent_suspended' : 'agent_reinstated',
+      reason: trigger,
+      payload: { agentId, caseId, decidedBy: decider.id },
+    });
+  });
   if (status === 'blocked') summary.agentsSuspended++;
   else summary.agentsReinstated++;
 }

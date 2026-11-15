@@ -143,6 +143,8 @@ export const Release = z.object({
   onTimeout: z.enum(['refund', 'escalate', 'release']).default('escalate'),
   /** When evidence contradicts the deal: ask a person, or wait for corrected evidence. */
   onBlocked: z.enum(['escalate', 'wait']).default('escalate'),
+  /** How long after settlement a party may still file a claim against the deal. */
+  claimWindow: Duration.default('7d'),
 });
 
 export const SettlementTiming = z.discriminatedUnion('mode', [
@@ -167,6 +169,17 @@ export const Settlement = z.object({
   /** How long a suspended member's deferred deals wait to be cured before they are refunded. */
   cureWindow: Duration.default('7d'),
 });
+
+/**
+ * What the platform charges, as basis points of each settled deal. `platformShareBps` of each fee
+ * is the platform's revenue and the rest is the house's.
+ */
+export const Fees = z.object({
+  sellerBps: Bps.default(0),
+  buyerBps: Bps.default(0),
+  platformShareBps: Bps.default(10_000),
+});
+export type Fees = z.infer<typeof Fees>;
 
 /** Who loses if a net debtor defaults. */
 export const Risk = z.object({
@@ -216,12 +229,16 @@ export const Decisions = z.object({
   limits: DecisionLimits.default(DecisionLimits.parse({})),
   /** Whether agents get the whole ceiling at once, or have to earn it. */
   autonomy: Autonomy.default({ mode: 'fixed' }),
-  /** How many times a model may retry after code rejects its proposal. */
+  /** How many proposals a model may make on one case, each after code refused the last. */
   modelAttempts: z.int().min(1).max(5).default(2),
   timeout: Duration.default('48h'),
   /** What happens to a frozen deal if nobody decides in time. */
   onTimeout: z.enum(['cancel', 'proceed']).default('cancel'),
 });
+
+/** The tenant's ceiling in one currency. A currency with no entry has none: nothing is automated. */
+export const ceilingIn = (decisions: Pick<Decisions, 'ceiling'>, currency: string): number =>
+  decisions.ceiling[currency] ?? 0;
 
 /** Whether an agent looks at a scheduled cycle before it runs, and may hold it back. */
 export const Treasury = z.discriminatedUnion('mode', [
@@ -255,6 +272,7 @@ export const PolicyCore = z.object({
   treasury: Treasury.default({ mode: 'off' }),
   decisions: Decisions.default(Decisions.parse({})),
   monitor: Monitor.default(Monitor.parse({})),
+  fees: Fees.optional(),
 });
 export type PolicyCore = z.infer<typeof PolicyCore>;
 

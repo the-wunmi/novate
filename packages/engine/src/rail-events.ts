@@ -12,7 +12,8 @@ import { Accounts } from '@novate/ledger';
 import type { RailEvent, SettlementRail } from '@novate/rails';
 import { and, eq, sql } from 'drizzle-orm';
 import { cardPaymentEvent } from './card-funding.ts';
-import { deps, isWorkflowControl, networkStep, tx } from './deps.ts';
+import { recordControl, SYSTEM } from './control.ts';
+import { deps, isWorkflowControl, networkStep, paced, tx } from './deps.ts';
 import { deposit, depositTransfer, holdUnmatchedDeposit } from './funds.ts';
 import { notify } from './notifications.ts';
 import { getMember } from './repo.ts';
@@ -74,6 +75,27 @@ async function recordRailEvent(
     workflowID: stableUuid(`${railName}:${event.id}`),
   })(railName, rowId, event);
   return { duplicate: !created };
+}
+
+/**
+ * What a rail said about a payment when asked directly, taken in as the event it would have sent,
+ * so it is handled exactly as a webhook would be. The id is stable per answer, so asking again and
+ * hearing the same thing does nothing twice.
+ */
+export async function recordPaymentStatus(
+  railName: string,
+  externalRef: string,
+  status: 'confirmed' | 'failed',
+  reason?: string,
+): Promise<{ duplicate: boolean }> {
+  const event: RailEvent = {
+    id: `status:${externalRef}:${status}`,
+    type: status === 'confirmed' ? 'payment.confirmed' : 'payment.failed',
+    occurredAt: new Date().toISOString(),
+    externalRef,
+    raw: { source: 'status_check', status, ...(reason ? { reason } : {}) },
+  };
+  return recordRailEvent(railName, event, { ...event.raw, externalRef });
 }
 
 const EVENT_ATTEMPTS = 12;
@@ -145,7 +167,7 @@ async function routeWithRetries(railName: string, event: RailEvent): Promise<str
         });
         return 'failed';
       }
-      await DBOS.sleep(Math.min(MAX_EVENT_RETRY_MS, EVENT_RETRY_MS * 2 ** attempt));
+      await DBOS.sleep(paced(Math.min(MAX_EVENT_RETRY_MS, EVENT_RETRY_MS * 2 ** attempt)));
     }
   }
 }
@@ -322,6 +344,18 @@ async function depositReversed(db: Tx, railName: string, event: RailEvent): Prom
   await ledger.post(db, member.tenantId, transfers);
   if (short > 0n) {
     await db.update(members).set({ status: 'suspended' }).where(eq(members.id, member.id));
+    await recordControl(db, member.tenantId, SYSTEM, {
+      type: 'member_suspended',
+      reason: 'A deposit was reversed after the member had spent it',
+      payload: {
+        memberId: member.id,
+        from: member.status,
+        rail: railName,
+        externalRef: event.externalRef,
+        currency: event.currency,
+        shortfall: short,
+      },
+    });
     return 'reversed_member_suspended';
   }
   return 'reversed';
@@ -357,6 +391,7 @@ async function paymentReturned(
       amount: ins.amount - kept,
       kind: 'payout_returned',
       ref,
+      instructionId: ins.id,
     },
   ]);
   await db

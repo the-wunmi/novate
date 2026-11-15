@@ -1,9 +1,8 @@
-import type { CaseView, ProgramSpecInput } from '@novate/policy';
-import { presetInputs } from '@novate/policy';
+import type { CaseView } from '@novate/policy';
 import { MockRail } from '@novate/rails';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { submitFact } from '../src/index.ts';
-import { boot, brain, eur, makeWorld, shutdown, waitFor } from './harness.ts';
+import { boot, brain, eur, makeWorld, netProgram, shutdown, waitFor } from './harness.ts';
 
 /**
  * The evaluation set in `packages/agents/eval` builds cases by hand. These tests pin down that the
@@ -15,12 +14,7 @@ beforeAll(async () => {
 });
 afterAll(() => shutdown());
 
-const net: ProgramSpecInput = {
-  ...presetInputs.netSettlement,
-  overrides: [],
-  signals: ['history'],
-  settlement: { rail: 'mock' },
-};
+const net = netProgram({ signals: ['history'] });
 
 function capturing(type: string, extra: Record<string, unknown> = {}) {
   const seen: CaseView[] = [];

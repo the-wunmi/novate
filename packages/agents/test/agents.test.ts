@@ -7,6 +7,8 @@ import {
   ClaudeDecisionAgent,
   ClaudeDocumentReader,
   ClaudeModelClient,
+  DECISION_PROMPT_HASH,
+  DECISION_PROMPT_VERSION,
   type ModelClient,
   type ModelRequest,
   type ModelUnusableError,
@@ -56,6 +58,14 @@ describe('decision agent', () => {
     const p = await new ClaudeDecisionAgent(model).decide(view, []);
     expect(Action.safeParse(p.action).success).toBe(true);
     expect(p.metadata?.bindingHash).toBe('h');
+    // The record names the model and the exact instructions it was given.
+    expect(p.metadata).toMatchObject({
+      model: 'stub',
+      promptVersion: DECISION_PROMPT_VERSION,
+      promptHash: DECISION_PROMPT_HASH,
+    });
+    const trial = await new ClaudeDecisionAgent(model, 'be stricter').decide(view, []);
+    expect(trial.metadata?.promptHash).not.toBe(DECISION_PROMPT_HASH);
   });
 
   it('tells the model why its last proposal was refused', async () => {
@@ -246,6 +256,6 @@ describe('claude client', () => {
     const agent = stub({ ...blank, action_type: 'escalate', note: 'n', rationale: 'r' });
     const p = await new ClaudeDecisionAgent(agent.model).decide(view, []);
     expect(agent.calls[0]?.cacheSystem).toBe(true);
-    expect(p.metadata?.answeredBy).toBe('claude:stub');
+    expect(p.metadata?.model).toBe('stub');
   });
 });

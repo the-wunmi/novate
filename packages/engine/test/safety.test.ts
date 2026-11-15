@@ -1,23 +1,30 @@
 import { randomUUID } from 'node:crypto';
-import { type DecisionAgent, type ProgramSpecInput, presetInputs } from '@novate/policy';
+import {
+  type ActionCheck,
+  type DecisionAgent,
+  type ProgramSpecInput,
+  presetInputs,
+  refusalsOf,
+} from '@novate/policy';
 import { MockRail } from '@novate/rails';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   caseRecords,
   dealDetail,
   decideCase,
-  setMemberRailRefs,
   submitDeal,
   submitFact,
   withinRateLimit,
 } from '../src/index.ts';
 import {
+  assignRailRefs,
   boot,
   brain,
   eur,
   gbp,
   makeWorld,
   notified,
+  personDecides,
   shutdown,
   waitFor,
   waitForCase,
@@ -186,10 +193,10 @@ describe('rail identity', () => {
   it('refuses to give two members the same account', async () => {
     const w = await funded();
     const account = `acct_${w.tenantId}`;
-    await setMemberRailRefs(w.tenantId, w.brand, { airwallex_account: account });
-    await expect(
-      setMemberRailRefs(w.tenantId, w.retailer, { airwallex_account: account }),
-    ).rejects.toThrow(/already assigned/);
+    await assignRailRefs(w, w.brand, { airwallex_account: account });
+    await expect(assignRailRefs(w, w.retailer, { airwallex_account: account })).rejects.toThrow(
+      /already assigned/,
+    );
   });
 });
 
@@ -212,7 +219,7 @@ describe('authority', () => {
   });
 
   it('concurrent deals cannot squeeze under a monthly limit', async () => {
-    const w = await funded(undefined, { monthlyLimit: eur('2000') });
+    const w = await funded(undefined, { EUR: { monthlyLimit: eur('2000') } });
     await w.fund(w.brand, 'GBP', gbp('50000'));
     const deals = await Promise.all(
       [1, 2, 3, 4].map((i) =>
@@ -252,7 +259,7 @@ describe('decision gateway', () => {
     const { cases } = await dealDetail(d.id, w.platform);
     const records = await caseRecords(w.tenantId, cases[0]?.id as string);
     expect(records.map((r) => r.accepted)).toEqual([0, 1]);
-    expect(records[0]?.violations[0]).toMatch(/not allowed/);
+    expect(refusalsOf(records[0]?.checks as ActionCheck[])[0]).toMatch(/not allowed/);
   });
 
   it('sends anything over the ceiling straight to a person', async () => {
@@ -263,10 +270,14 @@ describe('decision gateway', () => {
     };
     const w = await funded({ 'trade-assurance': low });
     const d = await w.deal({ buyer: 'retailer', seller: 'brand', quantity: 10, price: '15' });
-    const c = await waitForCase(w.tenantId, d.id);
+    const c = await waitForCase(w.tenantId, { dealId: d.id });
     await expect.poll(() => notified.some((n) => 'caseId' in n && n.caseId === c.id)).toBe(true);
     expect(await caseRecords(w.tenantId, c.id)).toHaveLength(0);
-    await decideCase(c.id, w.platform, { bindingHash: c.bindingHash, action: { type: 'cancel' } });
+    await personDecides(w, c.id, {
+      bindingHash: c.bindingHash,
+      rationale: 'Checked against the evidence',
+      action: { type: 'cancel' },
+    });
     await waitFor(d.id, ['cancelled']);
   });
 
@@ -279,13 +290,17 @@ describe('decision gateway', () => {
     };
     const w = await funded({ 'trade-assurance': freezeEverything });
     const d = await w.deal({ buyer: 'retailer', seller: 'brand', quantity: 10, price: '15' });
-    const c = await waitForCase(w.tenantId, d.id);
+    const c = await waitForCase(w.tenantId, { dealId: d.id });
     await expect
       .poll(async () => notified.some((n) => 'caseId' in n && n.caseId === c.id), {
         timeout: 20_000,
       })
       .toBe(true);
-    await decideCase(c.id, w.platform, { bindingHash: c.bindingHash, action: { type: 'cancel' } });
+    await personDecides(w, c.id, {
+      bindingHash: c.bindingHash,
+      rationale: 'Checked against the evidence',
+      action: { type: 'cancel' },
+    });
     await waitFor(d.id, ['cancelled']);
   });
 
@@ -318,14 +333,15 @@ describe('decision gateway', () => {
     const w = await makeWorld(
       rail,
       { 'trade-assurance': freezeEverything },
-      { monthlyLimit: eur('1000') },
+      { EUR: { monthlyLimit: eur('1000') } },
     );
     await w.fund(w.brand, 'GBP', gbp('50000'));
     await w.fund(w.supplier, 'EUR', eur('5000'));
     const d = await w.deal({ buyer: 'brand', seller: 'supplier', quantity: 10, price: '10' });
-    const c = await waitForCase(w.tenantId, d.id);
-    await decideCase(c.id, w.platform, {
+    const c = await waitForCase(w.tenantId, { dealId: d.id });
+    await personDecides(w, c.id, {
       bindingHash: c.bindingHash,
+      rationale: 'Checked against the evidence',
       action: {
         type: 'reprice',
         lines: [{ description: 'Mug', quantity: 1000, unitPrice: eur('10').toString() }],
@@ -341,15 +357,17 @@ describe('decision gateway', () => {
     const d = await w.deal({ buyer: 'retailer', seller: 'brand', quantity: 100, price: '15' });
     await waitFor(d.id, ['awaiting_conditions']);
     await w.pass(d.id, { amount: eur('1500'), quantity: 100, shipped: '2026-11-20' });
-    const c = await waitForCase(w.tenantId, d.id);
+    const c = await waitForCase(w.tenantId, { dealId: d.id });
     await expect(
       decideCase(c.id, w.asMember(w.brand), {
         bindingHash: c.bindingHash,
+        rationale: 'Checked against the evidence',
         action: { type: 'waive' },
       }),
     ).rejects.toThrow(/Not allowed/);
     await decideCase(c.id, w.asMember(w.retailer), {
       bindingHash: c.bindingHash,
+      rationale: 'Checked against the evidence',
       action: { type: 'waive' },
     });
     await waitFor(d.id, ['eligible']);
@@ -361,7 +379,7 @@ describe('decision gateway', () => {
     const d = await w.deal({ buyer: 'retailer', seller: 'brand', quantity: 100, price: '15' });
     await waitFor(d.id, ['awaiting_conditions']);
     await w.pass(d.id, { amount: eur('1500'), quantity: 100, shipped: '2026-11-20' });
-    const first = await waitForCase(w.tenantId, d.id);
+    const first = await waitForCase(w.tenantId, { dealId: d.id });
 
     await submitFact(d.id, w.inspector, {
       kind: 'inspection',
@@ -369,18 +387,22 @@ describe('decision gateway', () => {
       data: { passRate: 1 },
     });
     await expect(
-      decideCase(first.id, w.platform, {
+      decideCase(first.id, w.person, {
         bindingHash: first.bindingHash,
+        rationale: 'Checked against the evidence',
         action: { type: 'waive' },
       }),
     ).rejects.toThrow(/no longer matches|is stale/);
 
     await expect
-      .poll(async () => (await waitForCase(w.tenantId, d.id)).id !== first.id, { timeout: 20_000 })
+      .poll(async () => (await waitForCase(w.tenantId, { dealId: d.id })).id !== first.id, {
+        timeout: 20_000,
+      })
       .toBe(true);
-    const second = await waitForCase(w.tenantId, d.id);
-    await decideCase(second.id, w.platform, {
+    const second = await waitForCase(w.tenantId, { dealId: d.id });
+    await personDecides(w, second.id, {
       bindingHash: second.bindingHash,
+      rationale: 'Checked against the evidence',
       action: { type: 'waive' },
     });
     await waitFor(d.id, ['eligible']);

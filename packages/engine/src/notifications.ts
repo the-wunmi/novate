@@ -1,11 +1,45 @@
 import { DBOS } from '@dbos-inc/dbos-sdk';
-import { deps, isWorkflowControl } from './deps.ts';
+import { deps, isWorkflowControl, paced } from './deps.ts';
 
 /** Everything the house tells the outside world about. A new one is a new line here, nothing else. */
 export type Notification =
   | { type: 'case_needs_person'; tenantId: string; caseId: string; kind: string; reason: string }
   | { type: 'settlement_stopped'; tenantId: string; reason: string; caseId?: string }
   | { type: 'rail_event_failed'; rail: string; eventId: string; reason: string }
+  | {
+      /**
+       * A member is getting less than it was due, or later: a partial release, a deal held for
+       * review, or a payout that could not be sent and stayed in its wallet. Amounts are minor units.
+       */
+      type: 'payment_reduced';
+      tenantId: string;
+      memberId: string;
+      dealId?: string;
+      cycleId?: string;
+      currency: string;
+      /** What the member was due. */
+      expected: string;
+      /** What it is getting now. Zero while held. */
+      amount: string;
+      status: 'reduced' | 'held';
+      reason: string;
+    }
+  | {
+      /**
+       * An invite link for a person, sent to their own email by whatever receives notifications,
+       * when `NOVATE_INVITE_DELIVERY=notification`. The link works once, until `expiresAt`.
+       */
+      type: 'user_invite';
+      tenantId: string;
+      userId: string;
+      email: string;
+      name: string;
+      role: string;
+      inviteUrl: string;
+      expiresAt: string;
+      /** A first invite, a new link for someone who never accepted, or a reset account. */
+      why: 'invited' | 'reinvited' | 'reset';
+    }
   | {
       type: 'member_defaulted';
       tenantId: string;
@@ -27,6 +61,7 @@ async function deliverNotification(notification: Notification): Promise<void> {
       name: 'deliver',
       retriesAllowed: true,
       ...DELIVERY_RETRIES,
+      intervalSeconds: paced(DELIVERY_RETRIES.intervalSeconds * 1_000) / 1_000,
     });
   } catch (err) {
     if (isWorkflowControl(err)) throw err;

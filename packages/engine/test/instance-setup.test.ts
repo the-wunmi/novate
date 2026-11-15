@@ -1,15 +1,24 @@
 import { randomUUID } from 'node:crypto';
-import { apiKeys, createDb, createPool, type Db, instanceSetup, tenants } from '@novate/db';
+import {
+  apiKeys,
+  createDb,
+  createPool,
+  type Db,
+  instanceSetup,
+  tenants,
+  userInvites,
+  users,
+} from '@novate/db';
 import { runMigrations } from '@novate/db/migrate';
+import { testPoolSize } from '@novate/db/test-databases';
 import { sql } from 'drizzle-orm';
 import pg from 'pg';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
-import {
-  hashKey,
-  operatorKeyIsValid,
-  resetOperatorKey,
-  setUpInstance,
-} from '../src/instance-setup.ts';
+import { configureAuth } from '../src/auth-config.ts';
+import { hashToken } from '../src/auth-crypto.ts';
+import { operatorKeyIsValid, resetOperatorKey, setUpInstance } from '../src/instance-setup.ts';
+import { inviteToken } from '../src/users.ts';
+import { testAuth } from './harness.ts';
 
 // Its own database: a first run can only be seen where nothing has run yet.
 const name = `novate_setup_${randomUUID().replaceAll('-', '')}`;
@@ -18,7 +27,7 @@ let pool: ReturnType<typeof createPool>;
 let db: Db;
 
 beforeAll(async () => {
-  process.loadEnvFile(new URL('../../../.env', import.meta.url).pathname);
+  configureAuth(testAuth);
   const base = process.env.DATABASE_URL as string;
   admin = new pg.Client({ connectionString: base });
   await admin.connect();
@@ -26,7 +35,7 @@ beforeAll(async () => {
   const url = new URL(base);
   url.pathname = `/${name}`;
   await runMigrations(url.toString());
-  pool = createPool(url.toString());
+  pool = createPool(url.toString(), testPoolSize);
   db = createDb(pool);
 }, 60_000);
 
@@ -37,7 +46,19 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  await db.execute(sql`truncate instance_setup, api_keys, tenants cascade`);
+  // People are never removed, so the reset runs with triggers off, as only a superuser can.
+  await db.transaction(async (t) => {
+    await t.execute(sql`set local session_replication_role = replica`);
+    for (const table of [
+      'instance_setup',
+      'sessions',
+      'user_invites',
+      'users',
+      'api_keys',
+      'tenants',
+    ])
+      await t.execute(sql.raw(`delete from ${table}`));
+  });
 });
 
 describe('first boot', () => {
@@ -53,7 +74,31 @@ describe('first boot', () => {
     ]);
     expect(stored).not.toContain(first.operatorKey);
     expect(stored).not.toContain(first.platformKey);
-    expect(stored).toContain(hashKey(first.platformKey));
+    expect(stored).toContain(hashToken(first.platformKey));
+  });
+
+  it('invites a first house and platform user, storing only the invite hashes', async () => {
+    const state = await setUpInstance(db, ['airwallex'], {
+      house: 'Ops@Example.com',
+      platform: 'platform@example.com',
+    });
+    const first = state.firstRun as NonNullable<typeof state.firstRun>;
+    expect(first.invites.map((i) => [i.role, i.email])).toEqual([
+      ['house', 'ops@example.com'],
+      ['platform', 'platform@example.com'],
+    ]);
+    const people = await db.select().from(users).orderBy(users.role);
+    expect(people.map((u) => [u.role, u.status, u.tenantId])).toEqual([
+      ['house', 'invited', first.tenantId],
+      ['platform', 'invited', first.tenantId],
+    ]);
+    const stored = JSON.stringify([people, await db.select().from(userInvites)]);
+    for (const invite of first.invites) {
+      const token = inviteToken(invite.inviteUrl);
+      expect(invite.inviteUrl).toMatch(/\/console\/#\/invite\//);
+      expect(stored).not.toContain(token);
+      expect(stored).toContain(hashToken(token));
+    }
   });
 
   it('does nothing the second time, and shows no keys', async () => {

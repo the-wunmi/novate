@@ -1,11 +1,12 @@
 import { createHash } from 'node:crypto';
-import { type Currency, fxSellAmount } from '@novate/core';
+import { type Currency, fxSellAmount, minorUnits } from '@novate/core';
 import type {
   CardAcceptance,
   CardResult,
   FxConvertRequest,
   FxQuote,
   FxResult,
+  ProvisionInput,
   RailBalance,
   RailCapabilities,
   RailEvent,
@@ -14,6 +15,7 @@ import type {
   RailTransaction,
   SettlementRail,
 } from './index.ts';
+import { type DepositDetails, provisionRefs } from './refs.ts';
 
 export interface MockRailOptions {
   /** Whether this rail can debit members. Airwallex pooled custody cannot. */
@@ -29,6 +31,8 @@ export interface MockRailOptions {
   failNextPayoutFor?: Set<string>;
   /** Buy-currency units per sell-currency unit. */
   rates?: Record<string, number>;
+  /** Charge the sell side of a conversion rounded down, as a rail rounding to its own rule may. */
+  roundSellDown?: boolean;
   name?: string;
 }
 
@@ -45,12 +49,14 @@ export class MockRail implements SettlementRail {
   /** Charging this number is declined, as a real issuer might. */
   static readonly DECLINED_CARD = '4000000000000002';
   readonly name: string;
+  readonly environment = 'simulated' as const;
   readonly cardIntents = new Map<string, MockCardIntent>();
   /** Every number actually charged, to prove a retry did not charge again. */
   readonly cardsCharged: string[] = [];
   /** The next confirm charges the card, then loses the answer. */
   loseNextCardAnswer = false;
   readonly capabilities: RailCapabilities;
+  readonly provisionNeeds = 'beneficiary';
   readonly #payments = new Map<string, Payment>();
   readonly #fx = new Map<string, FxResult>();
   readonly #cash = new Map<string, bigint>();
@@ -159,7 +165,10 @@ export class MockRail implements SettlementRail {
     const prior = this.#fx.get(req.idempotencyKey);
     if (prior) return { ...prior };
     const { rateE8 } = await this.quote(req.sellCurrency, req.buyCurrency);
-    const sellAmount = fxSellAmount(req.buyAmount, rateE8, req.sellCurrency, req.buyCurrency);
+    const sellAmount = this.opts.roundSellDown
+      ? (req.buyAmount * 100_000_000n * 10n ** BigInt(minorUnits(req.sellCurrency))) /
+        (rateE8 * 10n ** BigInt(minorUnits(req.buyCurrency)))
+      : fxSellAmount(req.buyAmount, rateE8, req.sellCurrency, req.buyCurrency);
     const externalRef = `mockfx_${hash(req.idempotencyKey)}`;
     const result: FxResult = {
       status: 'confirmed',
@@ -187,6 +196,27 @@ export class MockRail implements SettlementRail {
 
   async transactions(since: Date): Promise<RailTransaction[]> {
     return this.#transactions.filter((t) => Date.parse(t.occurredAt) >= since.getTime());
+  }
+
+  /** Open a pretend local account and payee, returning the same kind of refs a real rail does. */
+  async provision(input: ProvisionInput): Promise<Record<string, string>> {
+    const id = hash(input.requestId);
+    const details: DepositDetails = {
+      currency: input.currency,
+      accountName: input.nickName,
+      accountNumber: String(BigInt(`0x${id}`) % 100_000_000n).padStart(8, '0'),
+      iban: null,
+      swiftCode: 'MOCKGB2L',
+      routing: [{ type: 'sort_code', value: '040004' }],
+      bankName: 'Mock Bank',
+      countryCode: input.countryCode,
+    };
+    return provisionRefs(this.name, {
+      depositAccount: `mockga_${id}`,
+      details,
+      beneficiary: `mockben_${id}`,
+      payee: input.beneficiary,
+    });
   }
 
   parseEvent(rawBody: string): RailEvent {

@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { runMigrations } from '@novate/db/migrate';
+import { testPoolSize } from '@novate/db/test-databases';
 import { ingestRailEvent, launchEngine } from '@novate/engine';
 import { presetInputs } from '@novate/policy';
 import { MockRail, RailRegistry } from '@novate/rails';
@@ -9,6 +10,7 @@ import { SettleError } from '@x402/core/types';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createApp } from '../src/app.ts';
 import type { X402Gateway } from '../src/x402.ts';
+import { testEngine } from './people.ts';
 
 const ADMIN = 'x402-admin';
 /** Fresh each run, so a payment left open by an earlier run cannot claim this run's deposit. */
@@ -58,9 +60,11 @@ const app = createApp({ x402: gateway, isOperator: async (key) => key === ADMIN 
 let engine: Awaited<ReturnType<typeof launchEngine>>;
 
 beforeAll(async () => {
-  process.loadEnvFile(new URL('../../../.env', import.meta.url).pathname);
   await runMigrations();
   engine = await launchEngine({
+    ...testEngine(),
+    pace: 0.01,
+    poolSize: testPoolSize,
     appName: `novate-x402-${Date.now()}`,
     rails: new RailRegistry().register(new MockRail({ name: 'metal' })),
   });
@@ -76,7 +80,7 @@ const call = (path: string, key: string, body?: unknown, headers: Record<string,
 
 async function fundingDeal(amountCents = 5_000) {
   const { tenant, apiKey } = (await (
-    await call('/tenants', ADMIN, { name: `x-${randomUUID()}` })
+    await call('/operator/tenants', ADMIN, { name: `x-${randomUUID()}` })
   ).json()) as { tenant: { id: string }; apiKey: string };
   const member = async (name: string) =>
     (
@@ -154,10 +158,11 @@ const available = async (key: string, tenantId: string, member: string) => {
   const rows = (await (
     await call(`/tenants/${tenantId}/members/${member}/balances`, key)
   ).json()) as {
-    code: string;
+    kind: string;
+    currency: string;
     balance: string;
   }[];
-  return rows.find((r) => r.code.endsWith(':USD:available'))?.balance ?? '0';
+  return rows.find((r) => r.kind === 'available' && r.currency === 'USD')?.balance ?? '0';
 };
 
 describe('funding a deal over x402', () => {
@@ -174,11 +179,20 @@ describe('funding a deal over x402', () => {
     expect(paid.headers.get('payment-response')).toBeTruthy();
     expect(await dealStatus(apiKey, dealId)).toBe('awaiting_funding');
 
+    const funding = async () =>
+      (
+        (await (
+          await call(`/tenants/${tenantId}/deals?memberId=${buyer}&limit=5`, apiKey)
+        ).json()) as { rows: { id: string; funding: string | null }[] }
+      ).rows.map((d) => [d.id, d.funding]);
+    expect(await funding()).toEqual([[dealId, null]]);
+
     await finalizedDeposit(TX, 5_000);
     await expect
       .poll(() => dealStatus(apiKey, dealId), { timeout: 15_000 })
       .toBe('awaiting_conditions');
     expect(await available(apiKey, tenantId, buyer)).toBe('0');
+    expect(await funding()).toEqual([[dealId, 'x402']]);
   });
 
   it('does not settle a payment for the wrong amount', async () => {
@@ -302,7 +316,7 @@ describe('funding a deal over x402', () => {
   it('keeps other tenants out', async () => {
     const { dealId } = await fundingDeal();
     const stranger = (await (
-      await call('/tenants', ADMIN, { name: `y-${randomUUID()}` })
+      await call('/operator/tenants', ADMIN, { name: `y-${randomUUID()}` })
     ).json()) as { apiKey: string };
     expect((await call(`/deals/${dealId}/x402`, stranger.apiKey, {})).status).toBe(404);
   });

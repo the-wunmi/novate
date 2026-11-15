@@ -1,13 +1,11 @@
-import { existsSync } from 'node:fs';
 import { serve } from '@hono/node-server';
 import { ClaudeDecisionAgent, ClaudeModelClient } from '@novate/agents';
+import { freshDatabasePair } from '@novate/db/test-databases';
 import {
   type Engine,
-  provisionMember,
   publishProgram,
   recordRailOpening,
   runCycle,
-  runReconciliation,
   submitFact,
 } from '@novate/engine';
 import { type ProgramSpecInput, presetInputs } from '@novate/policy';
@@ -17,22 +15,22 @@ import {
   boot,
   eur,
   gbp,
+  liveAccounts,
   makeWorld,
+  reconcile,
   shutdown,
   type World,
   waitFor,
 } from '../../../packages/engine/test/harness.ts';
 import { createApp } from '../src/app.ts';
 
-const envFile = new URL('../../../.env', import.meta.url).pathname;
-if (existsSync(envFile)) process.loadEnvFile(envFile);
-
 /**
  * Everything real at once: Airwallex's sandbox, its webhooks through a public tunnel to port 4000,
- * and Claude deciding a case. Run `pnpm webhook:register <tunnel>` first, then set NOVATE_LIVE=1.
+ * and Claude deciding a case. Run `pnpm webhook:register <tunnel>` first, then
+ * `pnpm test:live`.
  * Spends a little on the model.
  */
-describe.skipIf(process.env.NOVATE_LIVE !== '1')('all of it, for real', () => {
+describe('all of it, for real', () => {
   const rail = new AirwallexRail({
     clientId: process.env.AIRWALLEX_CLIENT_ID as string,
     apiKey: process.env.AIRWALLEX_API_KEY as string,
@@ -58,35 +56,15 @@ describe.skipIf(process.env.NOVATE_LIVE !== '1')('all of it, for real', () => {
   const started = new Date();
 
   const accounts = new Map<string, string>();
-  async function provision(w: World, memberId: string, currency: string, countryCode: string) {
-    await provisionMember(w.tenantId, memberId, {
-      idempotencyKey: crypto.randomUUID(),
-      rail: 'airwallex',
-      countryCode,
-      currency,
-      transferMethods: ['LOCAL'],
-      beneficiary: {
-        entity_type: 'COMPANY',
-        company_name: `novate test ${memberId.slice(0, 6)}`,
-        address: {
-          country_code: 'NL',
-          city: 'Amsterdam',
-          street_address: 'Damrak 1',
-          postcode: '1012LG',
-        },
-        bank_details: {
-          account_currency: 'EUR',
-          account_name: 'novate test',
-          bank_country_code: 'NL',
-          iban: 'NL91ABNA0417164300',
-          swift_code: 'ABNANL2A',
-        },
-      },
-    });
-    const member = await engine.db.query.members.findFirst({
-      where: (m, { eq: equals }) => equals(m.id, memberId),
-    });
-    accounts.set(memberId, member?.railRefs.airwallex_deposit_account as string);
+  async function provision(
+    w: World,
+    memberId: string,
+    slug: string,
+    currency: 'EUR' | 'GBP',
+    countryCode: string,
+  ) {
+    const refs = await liveAccounts(w, rail, memberId, slug, currency, countryCode);
+    accounts.set(memberId, refs.airwallex_deposit_account as string);
   }
 
   /** Money arrives on the rail and nothing else happens: only the webhook can credit it. */
@@ -104,8 +82,12 @@ describe.skipIf(process.env.NOVATE_LIVE !== '1')('all of it, for real', () => {
   }
 
   beforeAll(async () => {
+    // Its own databases: the members it makes share Global Accounts with every earlier run.
     engine = await boot(rail, [], {
+      ...(await freshDatabasePair('novate_test_sandbox_live')),
       decisionAgent: new ClaudeDecisionAgent(new ClaudeModelClient()),
+      // A real rail and model are retried and polled at production pace.
+      pace: 1,
     });
     server = serve({ fetch: createApp({ isOperator: async () => false }).fetch, port: 4000 });
     paying = setInterval(async () => {
@@ -129,9 +111,9 @@ describe.skipIf(process.env.NOVATE_LIVE !== '1')('all of it, for real', () => {
   it('funds by webhook, lets Claude decide, settles, and handles a payout coming back', async () => {
     const w = await makeWorld(rail as never, { 'trade-assurance': trade });
     await recordRailOpening(w.tenantId, 'airwallex');
-    await provision(w, w.brand, 'GBP', 'GB');
-    await provision(w, w.retailer, 'EUR', 'DE');
-    await provision(w, w.supplier, 'EUR', 'DE');
+    await provision(w, w.brand, 'brand', 'GBP', 'GB');
+    await provision(w, w.retailer, 'retailer', 'EUR', 'DE');
+    await provision(w, w.supplier, 'supplier', 'EUR', 'DE');
 
     await send(w, w.brand, 'GBP', gbp('15000'));
     const lastDeposit = await send(w, w.retailer, 'EUR', eur('9000'));
@@ -180,9 +162,9 @@ describe.skipIf(process.env.NOVATE_LIVE !== '1')('all of it, for real', () => {
     await waitFor(sell.id, ['eligible'], 60_000);
     expect((await runCycle(w.tenantId)).status).toBe('settled');
     await waitFor(buy.id, ['settled'], 120_000);
-    expect(await runReconciliation(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
+    expect(await reconcile(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
 
-    await publishProgram(w.tenantId, { key: 'net', spec: netted });
+    await publishProgram(w.tenantId, w.platform, { key: 'net', spec: netted });
     await send(w, w.retailer, 'EUR', eur('500'));
     const net = await w.deal({
       program: 'net',
@@ -200,7 +182,7 @@ describe.skipIf(process.env.NOVATE_LIVE !== '1')('all of it, for real', () => {
     await waitFor(net.id, ['eligible'], 60_000);
     expect((await runCycle(w.tenantId)).status).toBe('settled');
     await waitFor(net.id, ['settled'], 120_000);
-    expect(await runReconciliation(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
+    expect(await reconcile(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
 
     const heard = await engine.db.query.railEvents.findMany({
       where: (e, { and, eq, gte }) => and(eq(e.rail, 'airwallex'), gte(e.createdAt, started)),
@@ -231,6 +213,6 @@ describe.skipIf(process.env.NOVATE_LIVE !== '1')('all of it, for real', () => {
     await expect
       .poll(() => w.available(w.supplier, 'EUR'), { timeout: 90_000, interval: 500 })
       .toBe(wallet + (paid?.amount as bigint));
-    expect(await runReconciliation(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
+    expect(await reconcile(w.tenantId, 'airwallex')).toMatchObject({ status: 'clean' });
   }, 900_000);
 });

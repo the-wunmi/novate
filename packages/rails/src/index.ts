@@ -4,6 +4,7 @@ export * from './airwallex.ts';
 export * from './metal.ts';
 export * from './metal-client.ts';
 export * from './mock.ts';
+export * from './refs.ts';
 
 export interface RailMember {
   id: string;
@@ -171,6 +172,8 @@ export interface CardAcceptance {
  */
 export interface SettlementRail {
   readonly name: string;
+  /** Whether money on this rail is real, so a screen can say so. */
+  readonly environment: 'live' | 'sandbox' | 'testnet' | 'simulated';
   readonly capabilities: RailCapabilities;
   collect(req: RailRequest): Promise<RailResult>;
   payout(req: RailRequest): Promise<RailResult>;
@@ -184,11 +187,19 @@ export interface SettlementRail {
   readonly cards?: CardAcceptance;
   /** Create whatever the member needs on this rail, returning refs to store on the member. */
   provision?(input: ProvisionInput): Promise<Record<string, string>>;
+  /** Which of `ProvisionInput`'s details `provision` needs. Present with `provision`. */
+  readonly provisionNeeds?: 'beneficiary' | 'connectedAccount';
   /** For rails with no webhooks: what has happened since a cursor, in finalized form only. */
   pollEvents?(cursor: bigint | null): Promise<RailPoll>;
   /** Verify a webhook against its signature. Throws when the signature is wrong. */
   parseEvent(rawBody: string, headers: Record<string, string>): RailEvent;
 }
+
+const RAIL_LABELS: Record<string, string> = { airwallex: 'Airwallex', metal: 'Metal' };
+
+/** A rail's name as people read it. */
+export const railLabel = (rail: string) =>
+  RAIL_LABELS[rail] ?? rail.charAt(0).toUpperCase() + rail.slice(1);
 
 export class RailRegistry {
   readonly #rails = new Map<string, SettlementRail>();

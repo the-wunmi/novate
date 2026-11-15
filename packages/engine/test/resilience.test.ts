@@ -2,6 +2,7 @@ import { DBOS } from '@dbos-inc/dbos-sdk';
 import { type ProgramSpecInput, presetInputs } from '@novate/policy';
 import { MockRail } from '@novate/rails';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { deps } from '../src/deps.ts';
 import {
   balances,
   contributeToDefaultFund,
@@ -9,12 +10,14 @@ import {
   deposit,
   ingestRailEvent,
   monitorWorkflow,
+  recentCycles,
   runCycle,
   settleDueGroups,
+  settlementSummary,
   submitFact,
   tenantStatus,
 } from '../src/index.ts';
-import { boot, brain, eur, gbp, makeWorld, shutdown, waitFor } from './harness.ts';
+import { boot, brain, eur, gbp, makeWorld, netProgram, shutdown, waitFor } from './harness.ts';
 
 const flaky = new Set<string>();
 const flakyPayout = new Set<string>();
@@ -34,12 +37,16 @@ const puller = new MockRail({ name: 'puller', pullToLock: true });
 beforeAll(() => boot(main, [noPull, failing, slow, moving, puller]));
 afterAll(() => shutdown());
 
-const net = (over: Partial<ProgramSpecInput> = {}, railName = 'mock'): ProgramSpecInput => ({
-  ...presetInputs.netSettlement,
-  overrides: [],
-  settlement: { netting: 'multilateral', rail: railName, fundingWindow: '2s', confirmWithin: '1h' },
-  ...over,
-});
+const net = (over: Partial<ProgramSpecInput> = {}, railName = 'mock') =>
+  netProgram({
+    settlement: {
+      netting: 'multilateral',
+      rail: railName,
+      fundingWindow: '2s',
+      confirmWithin: '1h',
+    },
+    ...over,
+  });
 
 const accept = (w: Awaited<ReturnType<typeof makeWorld>>, dealId: string, buyer: string) =>
   submitFact(dealId, w.asMember(buyer), { kind: 'acceptance', type: 'buyer', data: {} });
@@ -139,9 +146,11 @@ describe('defaults', () => {
     expect(deferred.status).toBe('eligible');
     const { obligations } = await dealDetail(bad.id, w.platform);
     expect(obligations[0]?.status).toBe('eligible');
-    for (const b of await balances(w.tenantId, w.supplier)) {
-      if (b.code.endsWith(':settlement')) expect(b.balance).toBe(0n);
-    }
+    const positions = await deps().ledger.balances(deps().db, w.tenantId, {
+      memberId: w.supplier,
+      kinds: ['settlement'],
+    });
+    for (const b of positions) expect(b.balance).toBe(0n);
   });
 
   it('principal risk: creditors are paid and the house books the loss', async () => {
@@ -199,7 +208,8 @@ describe('defaults', () => {
     });
     flaky.add(w.retailer);
     await w.fund(w.brand, 'EUR', eur('1000'));
-    await contributeToDefaultFund(w.tenantId, {
+    await contributeToDefaultFund(w.tenantId, w.person, {
+      reason: 'Test contribution',
       memberId: w.brand,
       currency: 'EUR',
       amount: eur('1000'),
@@ -217,9 +227,7 @@ describe('defaults', () => {
     await waitFor(d.id, ['eligible']);
     expect((await runCycle(w.tenantId)).status).toBe('settled');
     await waitFor(d.id, ['settled']);
-    const fund = (await balances(w.tenantId, w.brand)).find((b) =>
-      b.code.endsWith(':default_fund'),
-    );
+    const fund = (await balances(w.tenantId, w.brand)).find((b) => b.kind === 'default_fund');
     expect(fund?.balance).toBe(eur('850'));
   });
 
@@ -317,6 +325,16 @@ describe('defaults', () => {
     await runCycle(w.tenantId);
     await waitFor(d.id, ['settled']);
     expect(await w.available(w.supplier, 'EUR')).toBe(eur('140'));
+    // The cycle lists it, so the overview and the cycles' "needs attention" can show it.
+    const [cycle] = await recentCycles(w.tenantId);
+    expect(cycle?.failed).toEqual([
+      expect.objectContaining({
+        memberId: w.supplier,
+        amount: eur('140'),
+        currency: 'EUR',
+        returnedToWallet: true,
+      }),
+    ]);
   });
 });
 
@@ -550,6 +568,9 @@ describe('resilience of FX and locks', () => {
     brain.current = undefined;
     expect((await runCycle(w.tenantId)).status).toBe('settled');
     await waitFor(d.id, ['settled']);
+    // The held-back cycle gave its obligations back, yet still counts and is listed.
+    expect((await settlementSummary(w.tenantId)).cycles).toEqual({ deferred: 1, settled: 1 });
+    expect((await recentCycles(w.tenantId)).map((c) => c.status)).toEqual(['settled', 'deferred']);
   });
 
   it('pulls a lock shortfall where the rail can debit the member', async () => {
@@ -589,5 +610,7 @@ describe('resilience of FX and locks', () => {
     expect((await dealDetail(d.id, w.platform)).obligations[0]?.status).toBe('eligible');
     expect((await tenantStatus(w.tenantId)).settlementHaltedAt).not.toBeNull();
     expect((await runCycle(w.tenantId)).status).toBe('halted');
+    expect((await settlementSummary(w.tenantId)).cycles).toEqual({ failed: 1 });
+    expect((await recentCycles(w.tenantId)).map((c) => c.status)).toEqual(['failed']);
   });
 });

@@ -69,7 +69,10 @@ export async function sampleFxRates(): Promise<number> {
   let sampled = 0;
   for (const { currency } of inUse) {
     const buyCurrency = baseFor(currency);
-    const quote = await rail.quote(currency, buyCurrency).catch(() => null);
+    const quote = await rail.quote(currency, buyCurrency).catch((err: unknown) => {
+      console.warn(`No ${currency}/${buyCurrency} rate sampled:`, (err as Error).message);
+      return null;
+    });
     if (!quote) continue;
     await db
       .insert(fxRateSamples)

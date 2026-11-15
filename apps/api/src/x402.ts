@@ -1,3 +1,4 @@
+import { setTimeout as sleep } from 'node:timers/promises';
 import { METAL_NETWORKS, type MetalNetworkName, registerMetalScheme } from '@metalntwx/metal-pay';
 import { mandateBindingAbi, verifyMandatePayment } from '@metalntwx/metal-pay/mandates';
 import { DomainError, sha256, toJson, toMajor } from '@novate/core';
@@ -127,7 +128,7 @@ async function untilFinal(
       finalized: { number: number | string };
     };
     if (BigInt(status.finalized.number) >= block) return;
-    await new Promise((resolve) => setTimeout(resolve, FINALITY_TRY_MS));
+    await sleep(FINALITY_TRY_MS);
   }
   throw new Error(`block ${block} was not finalized in time`);
 }

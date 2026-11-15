@@ -1,5 +1,16 @@
 import { createHash } from 'node:crypto';
 
+/** What a value becomes once written by `toJson` and read back: bigints and dates turn into strings. */
+export type Json<T> = T extends bigint | Date
+  ? string
+  : T extends string | number | boolean | null | undefined
+    ? T
+    : T extends readonly (infer U)[]
+      ? Json<U>[]
+      : T extends object
+        ? { [K in keyof T]: Json<T[K]> }
+        : T;
+
 /** JSON has no bigint, so amounts are written as strings of minor units. */
 export const toJson = (value: unknown): string =>
   JSON.stringify(value, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));

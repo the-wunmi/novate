@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   type Action,
+  type ActionCheck,
   type ActionContext,
+  checkAction,
   DecisionLimits,
+  describeCheck,
   ProgramSpec,
   presets,
   releaseAmount,
@@ -25,6 +28,58 @@ const ctx = (over: Partial<ActionContext> = {}): ActionContext => ({
   ...over,
 });
 const check = (a: Action, c: Partial<ActionContext> = {}) => validateAction(ctx(c), a);
+
+describe('a difference in client money', () => {
+  const ack: Action = { type: 'acknowledge', note: 'timing' };
+  const recon = { kind: 'recon_break' as const };
+
+  it('can only be acknowledged by a person, while agents may still stop settlement', () => {
+    expect(check(ack, { ...recon, decider: 'model' })).toEqual([
+      'acknowledging a reconciliation difference is reserved for a person',
+    ]);
+    expect(check(ack, { ...recon, decider: 'rule' })).toHaveLength(1);
+    expect(check(ack, { ...recon, decider: 'person' })).toEqual([]);
+    expect(check({ type: 'halt_settlement' }, { ...recon, decider: 'model' })).toEqual([]);
+  });
+});
+
+describe('checkAction', () => {
+  it('names each check with a stable code', () => {
+    const waive = checkAction(ctx(), { type: 'waive', codes: ['bl.shipment_late'] });
+    expect(waive.map((c) => [c.code, c.params])).toEqual([
+      ['allowed_action', { action: 'waive', kind: 'held' }],
+      ['ceiling', undefined],
+      ['waivable', undefined],
+      ['open_finding', { finding: 'bl.shipment_late' }],
+      ['waivable', { finding: 'bl.shipment_late' }],
+      ['program_allows_waive', { finding: 'bl.shipment_late' }],
+    ]);
+    const draw = checkAction(ctx(), { type: 'draw_margin', amount: '9000', reason: 'short' });
+    expect(draw.filter((c) => !c.passed).map((c) => c.code)).toEqual([
+      'draw_within_posted',
+      'draw_share',
+    ]);
+    expect(checkAction(ctx(), { type: 'confirm' })).toEqual([
+      { code: 'allowed_action', params: { action: 'confirm', kind: 'held' }, passed: false },
+    ]);
+  });
+
+  it('words each check from its code and numbers', () => {
+    const [allowed] = checkAction(ctx(), { type: 'confirm' });
+    expect(describeCheck(allowed as ActionCheck)).toBe('confirm is not allowed on a held case');
+    expect(describeCheck({ ...(allowed as ActionCheck), passed: true })).toBe(
+      'confirm is one of the actions allowed on a held case',
+    );
+    const reprice = checkAction(ctx({ kind: 'frozen', newAmount: 1n }), {
+      type: 'reprice',
+      lines: [] as never,
+    }).find((c) => c.code === 'reprice_floor') as ActionCheck;
+    expect(reprice.params).toMatchObject({ amount: '1', currency: 'EUR' });
+    expect(describeCheck(reprice)).toMatch(
+      /^reprice to 0\.01 EUR is below the allowed \d+\.\d{2} EUR$/,
+    );
+  });
+});
 
 describe('validateAction', () => {
   it('never lets an agent take a reserve below what the review supports', () => {
@@ -143,5 +198,31 @@ describe('program validation', () => {
   });
   it('still accepts valid conditions', () => {
     expect(withCondition({ type: 'acceptance' })).toBe(true);
+  });
+});
+
+describe('a claim after settlement', () => {
+  const claim = (claimant: 'buyer' | 'seller', limits: Partial<DecisionLimits>) =>
+    ({ kind: 'exception', claimant, limits: DecisionLimits.parse(limits) }) as const;
+
+  it("grants a seller's claim under the refund limit, not the force release limit", () => {
+    const pay: Action = { type: 'release_full' };
+    expect(check(pay, claim('seller', { allowForceRelease: true }))).toEqual([
+      "paying a seller's claim is reserved for people on this program",
+    ]);
+    expect(check(pay, claim('seller', { allowRefund: true }))).toEqual([]);
+    expect(check(pay, { ...claim('seller', {}), decider: 'person' })).toEqual([]);
+    expect(check(pay, claim('buyer', { allowRefund: true, allowForceRelease: true }))).toHaveLength(
+      1,
+    );
+  });
+
+  it("grants a buyer's claim under the refund limit only", () => {
+    const refund: Action = { type: 'refund' };
+    expect(check(refund, claim('buyer', { allowForceRelease: true }))).toEqual([
+      'refunds are reserved for people on this program',
+    ]);
+    expect(check(refund, claim('buyer', { allowRefund: true }))).toEqual([]);
+    expect(check(refund, claim('seller', { allowRefund: true }))).toHaveLength(1);
   });
 });
