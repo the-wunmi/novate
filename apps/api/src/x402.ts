@@ -48,7 +48,8 @@ function proveMandate(
     .prove(transaction, accepted, payer)
     .then((proof) => (proof ? service.recordMandateProof(offer, proof) : undefined))
     .catch((err: unknown) => {
-      console.error(`No mandate proof for ${transaction}:`, (err as Error).message);
+      const { shortMessage, message } = err as { shortMessage?: string; message: string };
+      console.error(`No mandate proof for ${transaction}:`, shortMessage ?? message);
     });
 }
 

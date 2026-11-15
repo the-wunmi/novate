@@ -227,6 +227,7 @@ export function createApp(options: AppOptions = {}) {
     return json(await engine.memberMargin(tenantOf(c), c.req.param('memberId') as string));
   });
   app.post('/tenants/:tenantId/members/:memberId/withdrawals', async (c) => {
+    requireKind(c, 'member', 'platform', 'house');
     ownMemberOnly(c);
     const memberId = c.req.param('memberId');
     return json(await engine.requestWithdrawal(tenantOf(c), memberId, await input(c)), 202);

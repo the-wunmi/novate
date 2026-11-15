@@ -93,6 +93,33 @@ describe('api security', () => {
     expect(res.status).toBe(404);
   });
 
+  it('does not let a member’s agent withdraw its money', async () => {
+    const { tenant, apiKey } = await makeTenant();
+    const member = (await (
+      await call(`/tenants/${tenant.id}/members`, apiKey, {
+        method: 'POST',
+        body: { name: 'm', homeCurrency: 'EUR' },
+      })
+    ).json()) as { id: string };
+    const { id: agentId } = (await (
+      await call(`/tenants/${tenant.id}/agents`, apiKey, {
+        method: 'POST',
+        body: { memberId: member.id, name: 'a', mandate: { roles: ['buy'], currencies: ['EUR'] } },
+      })
+    ).json()) as { id: string };
+    const agent = (await (
+      await call(`/tenants/${tenant.id}/keys`, apiKey, {
+        method: 'POST',
+        body: { name: 'a', principal: 'agent', memberId: member.id, agentId },
+      })
+    ).json()) as { key: string };
+    const res = await call(`/tenants/${tenant.id}/members/${member.id}/withdrawals`, agent.key, {
+      method: 'POST',
+      body: { currency: 'EUR', amount: '1' },
+    });
+    expect(res.status).toBe(403);
+  });
+
   it('keeps a rail account away from tenants that do not own it', async () => {
     const { tenant } = await makeTenant();
     const house = (await (
