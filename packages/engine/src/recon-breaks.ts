@@ -133,7 +133,7 @@ export async function openBreakRows(db: Tx, tenantId: string, rail?: string): Pr
         ...(rail ? [eq(reconRuns.rail, rail)] : []),
       ),
     )
-    .orderBy(asc(reconBreaks.createdAt));
+    .orderBy(asc(reconBreaks.createdAt), asc(reconBreaks.id));
   return rows.map((r) => ({ ...r.b, rail: r.rail }));
 }
 

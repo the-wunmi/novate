@@ -1,9 +1,11 @@
 // Payouts that need someone, across every cycle, and every member's withdrawals.
+import { type ReactNode, useState } from 'react';
 import { Link } from 'wouter';
 import { api, type Page, useAction, useTenant } from './api.ts';
 import { useSession } from './session.tsx';
-import type { ProblemPayout, TenantWithdrawal } from './types.ts';
+import type { ProblemPayout, TenantWithdrawal, WithdrawalAttempt } from './types.ts';
 import {
+  dateTime,
   duration,
   EmptyRow,
   LoadFailed,
@@ -13,6 +15,7 @@ import {
   PayoutStatus,
   railName,
   shortId,
+  type Tone,
 } from './ui.tsx';
 
 /** Payouts in doubt, failed or returned, newest first: one list the overview reads too. */
@@ -120,28 +123,38 @@ export function AllWithdrawals({ memberId }: { memberId?: string }) {
         </thead>
         <tbody>
           {rows.map((w) => (
-            <tr key={w.id}>
-              <td className="title-cell">
-                {memberId ? (
-                  railName(w.rail)
-                ) : (
-                  <>
-                    <Link href={`/members/${w.memberId}`}>{w.memberName}</Link>
-                    <small>{railName(w.rail)}</small>
-                  </>
-                )}
-              </td>
-              <td>
-                <PayoutStatus status={w.status} />
-                {w.failureReason && <small className="sub-line error">{w.failureReason}</small>}
-                {w.returnedToWallet && <small className="sub-line">Back in balance</small>}
-              </td>
-              <td className="muted nowrap">{duration(w.ageSeconds)}</td>
-              <td className="mono muted">{w.externalRef ?? '—'}</td>
-              <td className="num">
-                <Money value={w.amount} currency={w.currency} />
-              </td>
-            </tr>
+            <ExpandableRow
+              key={w.id}
+              cols={5}
+              detail={<WithdrawalAttempts tenantId={tenantId} memberId={w.memberId} id={w.id} />}
+              cells={(toggle) => (
+                <>
+                  <td className="title-cell">
+                    {toggle}
+                    {memberId ? (
+                      railName(w.rail)
+                    ) : (
+                      <>
+                        <Link href={`/members/${w.memberId}`} onClick={(e) => e.stopPropagation()}>
+                          {w.memberName}
+                        </Link>
+                        <small>{railName(w.rail)}</small>
+                      </>
+                    )}
+                  </td>
+                  <td>
+                    <PayoutStatus status={w.status} />
+                    {w.failureReason && <small className="sub-line error">{w.failureReason}</small>}
+                    {w.returnedToWallet && <small className="sub-line">Back in balance</small>}
+                  </td>
+                  <td className="muted nowrap">{duration(w.ageSeconds)}</td>
+                  <td className="mono muted">{w.externalRef ?? '—'}</td>
+                  <td className="num">
+                    <Money value={w.amount} currency={w.currency} />
+                  </td>
+                </>
+              )}
+            />
           ))}
           {list.data && !rows.length && <EmptyRow cols={5}>No withdrawals.</EmptyRow>}
           {list.error && !list.data && (
@@ -152,5 +165,89 @@ export function AllWithdrawals({ memberId }: { memberId?: string }) {
         </tbody>
       </table>
     </Panel>
+  );
+}
+
+/** A row that opens beneath itself to show more. `cells` places the toggle in its first cell. */
+export function ExpandableRow({
+  cols,
+  cells,
+  detail,
+}: {
+  cols: number;
+  cells: (toggle: ReactNode) => ReactNode;
+  detail: ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <tr className="row" onClick={() => setOpen(!open)}>
+        {cells(
+          <span className="chev" aria-hidden="true">
+            {open ? '▾' : '▸'}
+          </span>,
+        )}
+      </tr>
+      {open && (
+        <tr className="open">
+          <td colSpan={cols}>{detail}</td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+/** Each attempt at paying one withdrawal: a failed one is retried as a new attempt. */
+export function WithdrawalAttempts({
+  tenantId,
+  memberId,
+  id,
+  labels,
+}: {
+  tenantId: string;
+  memberId: string;
+  id: string;
+  labels?: Record<string, [string, Tone]>;
+}) {
+  const detail = useTenant<WithdrawalAttempt[]>(
+    tenantId,
+    `/members/${memberId}/withdrawals/${id}`,
+    { live: true },
+  );
+  if (detail.error && !detail.data) return <LoadFailed error={detail.error} />;
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>Attempt</th>
+          <th>Status</th>
+          <th>Reference</th>
+          <th>Created</th>
+          <th>Updated</th>
+          <th className="num">Amount</th>
+        </tr>
+      </thead>
+      <tbody>
+        {(detail.data ?? []).map((i) => (
+          <tr key={i.id}>
+            <td>{i.attempt}</td>
+            <td>
+              <PayoutStatus status={i.status} labels={labels} />
+              {i.failureReason && <small className="sub-line error">{i.failureReason}</small>}
+              {i.returnedToWalletAt && (
+                <small className="sub-line">Back in balance {dateTime(i.returnedToWalletAt)}</small>
+              )}
+            </td>
+            <td className="mono muted">{i.externalRef ?? '—'}</td>
+            <td className="muted nowrap">{dateTime(i.createdAt)}</td>
+            <td className="muted nowrap">{dateTime(i.updatedAt)}</td>
+            <td className="num">
+              <Money value={i.amount} currency={i.currency} />
+            </td>
+          </tr>
+        ))}
+        {!detail.data && <EmptyRow cols={6}>Loading…</EmptyRow>}
+      </tbody>
+    </table>
   );
 }

@@ -269,7 +269,9 @@ may only take actions against its own interest (`mayDecideCase`). A deal from a 
 other side to submit the same terms. Rail identifiers are changed only by a signed-in house person
 with a second one's approval (`rail_refs` above). Provisioning (`POST .../members/:id/provision`,
 house) opens a member's accounts on a rail once, recorded as the caller, and is refused once the
-member holds accounts there, since the caller chooses the payee details. `rail_refs_changed` keeps
+member holds accounts there, since the caller chooses the payee details. A new payee for a member
+already provisioned is created on the rail first (`changePayee`, `POST .../members/:id/payee`), and
+paying it is the same held `rail_refs` change. `rail_refs_changed` keeps
 the old and new values, the approval and its approver.
 
 Settlement accounts belong to a cycle (`Accounts.cycleSettlement`), and a cycle's positions are read
@@ -424,7 +426,7 @@ money). Each case has known right answers and answers listed as harmful, and goe
 validate-and-retry loop as the gateway. Options: `--trials=3`, `--only=substring`. It exits non-zero
 on any harmful answer or under 90% correct. Reports go to `packages/agents/eval/reports` (ignored).
 
-`pnpm demo` runs the mug scenario end to end on the in-memory rail, with no model and no real money. `pnpm demo:live` (`apps/api/src/demo-live.ts`) runs it on real Airwallex, Claude, MCP and Metal, on its own `novate_demo` databases, reusing the same Global Accounts through stable request ids so it spends no account quota after the first run. Stop any dev server first.
+`pnpm demo` (`apps/api/src/demo.ts`) runs the mug scenario end to end on the in-memory rail, with no model, no real money and no `.env`, on fresh `novate_demo_offline` databases, then keeps serving the console with the demo users on port 4100 (`NOVATE_DEMO_PORT`). `pnpm demo:live` (`apps/api/src/demo-live.ts`) runs it on real Airwallex, Claude, MCP and Metal, on its own `novate_demo` databases, reusing the same Global Accounts through stable request ids so it spends no account quota after the first run. Stop any dev server first.
 
 Add a case whenever a decision goes wrong in practice. `packages/engine/test/model-view.test.ts`
 checks the gateway really shows the model what these cases assume it can see.

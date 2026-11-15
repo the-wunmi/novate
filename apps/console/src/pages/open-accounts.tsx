@@ -13,7 +13,7 @@ const ACCOUNT_COUNTRIES: Record<string, string[]> = {
   USD: ['US', 'HK'],
   AUD: ['AU'],
 };
-const CURRENCIES = ['EUR', 'GBP', 'USD', 'AUD', 'SGD', 'HKD', 'CNY', 'JPY'];
+export const CURRENCIES = ['EUR', 'GBP', 'USD', 'AUD', 'SGD', 'HKD', 'CNY', 'JPY'];
 /** Without an IBAN, these countries route a local payment by a second number. */
 const ROUTING: Record<string, { type: string; label: string }> = {
   GB: { type: 'sort_code', label: 'Sort code' },
@@ -43,6 +43,150 @@ export function openableRails(rails: Rail[], row: MemberRow) {
 }
 
 /** Open a member's deposit account and payee on a rail, in pooled custody. */
+type Method = 'LOCAL' | 'SWIFT';
+
+/** Where a member is paid, as a house person types it. */
+export type Payee = ReturnType<typeof payeeDefaults>;
+
+export const payeeDefaults = (row: MemberRow, currency: string) => {
+  const company = row.legalName ?? row.name;
+  return {
+    companyName: company,
+    addressCountry: row.country ?? '',
+    city: '',
+    street: '',
+    postcode: '',
+    accountCurrency: currency,
+    accountName: company,
+    bankCountry: row.country ?? '',
+    account: '',
+    routing: '',
+    swift: '',
+  };
+};
+
+/** The bank account in a payee: an IBAN carries its own country and needs no routing number. */
+function bankOf(p: Payee) {
+  const account = compact(p.account);
+  const iban = isIban(account);
+  const bankCountry = iban ? account.slice(0, 2) : p.bankCountry.trim().toUpperCase();
+  return { account, iban, bankCountry, routing: iban ? undefined : ROUTING[bankCountry] };
+}
+
+/** An Airwallex beneficiary for a company. */
+export function beneficiaryOf(p: Payee) {
+  const { account, iban, bankCountry, routing } = bankOf(p);
+  return {
+    entity_type: 'COMPANY',
+    company_name: p.companyName.trim(),
+    address: {
+      country_code: p.addressCountry.trim().toUpperCase(),
+      city: p.city.trim(),
+      street_address: p.street.trim(),
+      postcode: p.postcode.trim(),
+    },
+    bank_details: {
+      account_currency: p.accountCurrency,
+      account_name: p.accountName.trim(),
+      bank_country_code: bankCountry,
+      ...(iban ? { iban: account } : { account_number: account }),
+      ...(routing && p.routing.trim()
+        ? { account_routing_type1: routing.type, account_routing_value1: compact(p.routing) }
+        : {}),
+      ...(p.swift.trim() ? { swift_code: compact(p.swift) } : {}),
+    },
+  };
+}
+
+export function PayeeFields({
+  payee,
+  onChange,
+  currency,
+  method,
+}: {
+  payee: Payee;
+  onChange: (p: Payee) => void;
+  currency: string;
+  method: Method;
+}) {
+  const set = (k: keyof Payee) => (e: { target: { value: string } }) =>
+    onChange({ ...payee, [k]: e.target.value });
+  const { iban, routing } = bankOf(payee);
+  return (
+    <div className="form-grid">
+      <label className="field">
+        Company name
+        <input required value={payee.companyName} onChange={set('companyName')} />
+      </label>
+      <label className="field">
+        Account name
+        <input required value={payee.accountName} onChange={set('accountName')} />
+      </label>
+      <label className="field">
+        Account currency
+        <select value={payee.accountCurrency} onChange={set('accountCurrency')}>
+          {[...new Set([currency, ...CURRENCIES])].map((c) => (
+            <option key={c}>{c}</option>
+          ))}
+        </select>
+      </label>
+      <label className="field">
+        IBAN or account number
+        <input required value={payee.account} onChange={set('account')} />
+      </label>
+      {!iban && (
+        <label className="field">
+          Bank country
+          <input
+            required
+            maxLength={2}
+            pattern="[A-Za-z]{2}"
+            value={payee.bankCountry}
+            onChange={set('bankCountry')}
+          />
+        </label>
+      )}
+      {routing && (
+        <label className="field">
+          {routing.label}
+          <input required value={payee.routing} onChange={set('routing')} />
+        </label>
+      )}
+      <label className="field">
+        SWIFT/BIC
+        <input
+          required={method === 'SWIFT'}
+          pattern="[A-Za-z0-9 ]{8,13}"
+          value={payee.swift}
+          onChange={set('swift')}
+        />
+      </label>
+      <label className="field">
+        Street
+        <input required value={payee.street} onChange={set('street')} />
+      </label>
+      <label className="field">
+        City
+        <input required value={payee.city} onChange={set('city')} />
+      </label>
+      <label className="field">
+        Postcode
+        <input required value={payee.postcode} onChange={set('postcode')} />
+      </label>
+      <label className="field">
+        Country
+        <input
+          required
+          maxLength={2}
+          pattern="[A-Za-z]{2}"
+          value={payee.addressCountry}
+          onChange={set('addressCountry')}
+        />
+      </label>
+    </div>
+  );
+}
+
 export function OpenAccounts({
   row,
   rails,
@@ -53,32 +197,17 @@ export function OpenAccounts({
   onClose: () => void;
 }) {
   const { tenantId } = useSession();
-  const company = row.legalName ?? row.name;
   const [key, setKey] = useState(() => crypto.randomUUID());
   const [form, setForm] = useState({
     rail: rails[0]?.name ?? '',
     currency: row.homeCurrency,
     country: ACCOUNT_COUNTRIES[row.homeCurrency]?.[0] ?? row.country ?? '',
-    method: 'LOCAL' as 'LOCAL' | 'SWIFT',
-    companyName: company,
-    addressCountry: row.country ?? '',
-    city: '',
-    street: '',
-    postcode: '',
-    accountCurrency: row.homeCurrency,
-    accountName: company,
-    bankCountry: row.country ?? '',
-    account: '',
-    routing: '',
-    swift: '',
+    method: 'LOCAL' as Method,
   });
+  const [payee, setPayee] = useState(() => payeeDefaults(row, row.homeCurrency));
   const set = (k: keyof typeof form) => (e: { target: { value: string } }) =>
     setForm({ ...form, [k]: e.target.value });
   const countries = ACCOUNT_COUNTRIES[form.currency];
-  const account = compact(form.account);
-  const iban = isIban(account);
-  const bankCountry = iban ? account.slice(0, 2) : form.bankCountry.trim().toUpperCase();
-  const routing = iban ? undefined : ROUTING[bankCountry];
 
   const open = useAction(tenantId, {
     run: () =>
@@ -89,29 +218,7 @@ export function OpenAccounts({
           countryCode: form.country.trim().toUpperCase(),
           transferMethods: [form.method],
           idempotencyKey: key,
-          beneficiary: {
-            entity_type: 'COMPANY',
-            company_name: form.companyName.trim(),
-            address: {
-              country_code: form.addressCountry.trim().toUpperCase(),
-              city: form.city.trim(),
-              street_address: form.street.trim(),
-              postcode: form.postcode.trim(),
-            },
-            bank_details: {
-              account_currency: form.accountCurrency,
-              account_name: form.accountName.trim(),
-              bank_country_code: bankCountry,
-              ...(iban ? { iban: account } : { account_number: account }),
-              ...(routing && form.routing.trim()
-                ? {
-                    account_routing_type1: routing.type,
-                    account_routing_value1: compact(form.routing),
-                  }
-                : {}),
-              ...(form.swift.trim() ? { swift_code: compact(form.swift) } : {}),
-            },
-          },
+          beneficiary: beneficiaryOf(payee),
         },
       }),
     done: `Accounts opened for ${row.name}`,
@@ -164,8 +271,8 @@ export function OpenAccounts({
                     ...form,
                     currency,
                     country: list?.[0] ?? row.country ?? '',
-                    accountCurrency: currency,
                   });
+                  setPayee({ ...payee, accountCurrency: currency });
                 }}
               >
                 {[...new Set([row.homeCurrency, ...CURRENCIES])].map((c) => (
@@ -205,77 +312,12 @@ export function OpenAccounts({
             </label>
           </div>
           <h3 className="form-section">Payee</h3>
-          <div className="form-grid">
-            <label className="field">
-              Company name
-              <input required value={form.companyName} onChange={set('companyName')} />
-            </label>
-            <label className="field">
-              Account name
-              <input required value={form.accountName} onChange={set('accountName')} />
-            </label>
-            <label className="field">
-              Account currency
-              <select value={form.accountCurrency} onChange={set('accountCurrency')}>
-                {[...new Set([form.currency, ...CURRENCIES])].map((c) => (
-                  <option key={c}>{c}</option>
-                ))}
-              </select>
-            </label>
-            <label className="field">
-              IBAN or account number
-              <input required value={form.account} onChange={set('account')} />
-            </label>
-            {!iban && (
-              <label className="field">
-                Bank country
-                <input
-                  required
-                  maxLength={2}
-                  pattern="[A-Za-z]{2}"
-                  value={form.bankCountry}
-                  onChange={set('bankCountry')}
-                />
-              </label>
-            )}
-            {routing && (
-              <label className="field">
-                {routing.label}
-                <input required value={form.routing} onChange={set('routing')} />
-              </label>
-            )}
-            <label className="field">
-              SWIFT/BIC
-              <input
-                required={form.method === 'SWIFT'}
-                pattern="[A-Za-z0-9 ]{8,13}"
-                value={form.swift}
-                onChange={set('swift')}
-              />
-            </label>
-            <label className="field">
-              Street
-              <input required value={form.street} onChange={set('street')} />
-            </label>
-            <label className="field">
-              City
-              <input required value={form.city} onChange={set('city')} />
-            </label>
-            <label className="field">
-              Postcode
-              <input required value={form.postcode} onChange={set('postcode')} />
-            </label>
-            <label className="field">
-              Country
-              <input
-                required
-                maxLength={2}
-                pattern="[A-Za-z]{2}"
-                value={form.addressCountry}
-                onChange={set('addressCountry')}
-              />
-            </label>
-          </div>
+          <PayeeFields
+            payee={payee}
+            onChange={setPayee}
+            currency={form.currency}
+            method={form.method}
+          />
         </div>
       </Panel>
     </form>

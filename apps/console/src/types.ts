@@ -79,6 +79,8 @@ export type MemberUser = Out<typeof engine.memberUsers>[number];
 
 export type ProblemPayout = RowOf<typeof engine.problemPayouts>;
 export type TenantWithdrawal = RowOf<typeof engine.tenantWithdrawals>;
+/** Every attempt at paying one withdrawal, first to last. */
+export type WithdrawalAttempt = Out<typeof engine.withdrawalDetail>[number];
 export type ControlEvent = RowOf<typeof engine.controlEventFeed>;
 export type UserSession = RowOf<typeof engine.userSessions>;
 export type ApiKey = RowOf<typeof engine.listApiKeys>;

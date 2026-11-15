@@ -327,6 +327,9 @@ describe('what the console reads', () => {
       status: 'confirmed' as const,
       externalRef: ref,
       idempotencyKey: ref,
+      // Stamped as the engine stamps a confirmation, on the app's clock that the opening uses too.
+      // Left to the database's default, a lagging database clock dates it before the opening.
+      updatedAt: new Date(),
     });
     const [gone, short] = [`gone-${randomUUID()}`, `short-${randomUUID()}`];
     const [missing] = await engine.db

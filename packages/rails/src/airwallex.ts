@@ -7,6 +7,7 @@ import type {
   FxConvertRequest,
   FxQuote,
   FxResult,
+  PayeeInput,
   ProvisionInput,
   RailBalance,
   RailCapabilities,
@@ -19,7 +20,7 @@ import type {
   RailTransaction,
   SettlementRail,
 } from './index.ts';
-import { depositDetailsOf, provisionRefs } from './refs.ts';
+import { depositDetailsOf, payeeRefs, provisionRefs } from './refs.ts';
 
 export interface AirwallexConfig {
   clientId: string;
@@ -508,16 +509,31 @@ export class AirwallexRail implements SettlementRail {
     if (this.#connected) return this.#openConnectedAccount(input);
     if (!input.beneficiary) throw new Error('Pooled custody needs a beneficiary');
     const account = await this.#globalAccount(input);
-    const beneficiary = await this.#call<{ id: string }>('POST', '/api/v1/beneficiaries/create', {
-      beneficiary: input.beneficiary,
-      transfer_methods: input.transferMethods,
-    });
+    const beneficiary = await this.#createBeneficiary(input.beneficiary, input.transferMethods);
     return provisionRefs(this.name, {
       depositAccount: account.id,
       details: depositDetailsOf(account, input.currency),
-      beneficiary: beneficiary.id,
+      beneficiary,
       payee: input.beneficiary,
     });
+  }
+
+  /** A new payee for a member whose accounts are open: where its payouts go from now on. */
+  async addPayee(input: PayeeInput): Promise<Record<string, string>> {
+    if (this.#connected) throw new DomainError('invalid', 'Connected accounts are paid directly');
+    const id = await this.#createBeneficiary(input.beneficiary, input.transferMethods);
+    return payeeRefs(this.name, id, input.beneficiary);
+  }
+
+  async #createBeneficiary(
+    beneficiary: Record<string, unknown>,
+    transferMethods: ProvisionInput['transferMethods'],
+  ): Promise<string> {
+    const made = await this.#call<{ id: string }>('POST', '/api/v1/beneficiaries/create', {
+      beneficiary,
+      transfer_methods: transferMethods,
+    });
+    return made.id;
   }
 
   /** Airwallex refuses a repeated request id, so a retry finds the account the first try made. */

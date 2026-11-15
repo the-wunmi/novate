@@ -5,6 +5,7 @@ import { api, isPending, type Page, useAction, usePaged, useTenant } from '../ap
 import { DecideApproval } from '../approvals.tsx';
 import { APPROVAL_KINDS } from '../describe.tsx';
 import { currenciesOf, LimitsView } from '../limits.tsx';
+import { ExpandableRow, WithdrawalAttempts } from '../ops.tsx';
 import { PayInPayOut } from '../pay-details.tsx';
 import { StatementPanel } from '../statement.tsx';
 import type { Agent, Approval, Me, MemberUser, MemberWithdrawal, Statement } from '../types.ts';
@@ -251,19 +252,42 @@ function Withdrawals({ me }: { me: Me }) {
           </thead>
           <tbody>
             {rows.map((w) => (
-              <tr key={w.id}>
-                <td className="nowrap">{dateTime(w.at)}</td>
-                <td>
-                  <PayoutStatus status={w.status} labels={WITHDRAWAL} />
-                  {w.paidAt && <small className="sub-line faint">Paid {dateTime(w.paidAt)}</small>}
-                  {w.failureReason && <small className="sub-line error">{w.failureReason}</small>}
-                  {w.returnedToWallet && <small className="sub-line">Back in your balance</small>}
-                </td>
-                <td className="mono muted">{w.externalRef ?? '—'}</td>
-                <td className="num">
-                  <Money value={w.amount} currency={w.currency} />
-                </td>
-              </tr>
+              <ExpandableRow
+                key={w.id}
+                cols={4}
+                detail={
+                  <WithdrawalAttempts
+                    tenantId={me.tenantId}
+                    memberId={me.memberId as string}
+                    id={w.id}
+                    labels={WITHDRAWAL}
+                  />
+                }
+                cells={(toggle) => (
+                  <>
+                    <td className="nowrap">
+                      {toggle}
+                      {dateTime(w.at)}
+                    </td>
+                    <td>
+                      <PayoutStatus status={w.status} labels={WITHDRAWAL} />
+                      {w.paidAt && (
+                        <small className="sub-line faint">Paid {dateTime(w.paidAt)}</small>
+                      )}
+                      {w.failureReason && (
+                        <small className="sub-line error">{w.failureReason}</small>
+                      )}
+                      {w.returnedToWallet && (
+                        <small className="sub-line">Back in your balance</small>
+                      )}
+                    </td>
+                    <td className="mono muted">{w.externalRef ?? '—'}</td>
+                    <td className="num">
+                      <Money value={w.amount} currency={w.currency} />
+                    </td>
+                  </>
+                )}
+              />
             ))}
             {list.rows && !rows.length && <EmptyRow cols={4}>No withdrawals.</EmptyRow>}
             {!list.rows && <EmptyRow cols={4}>Loading…</EmptyRow>}

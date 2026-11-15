@@ -6,6 +6,7 @@ import type {
   FxConvertRequest,
   FxQuote,
   FxResult,
+  PayeeInput,
   ProvisionInput,
   RailBalance,
   RailCapabilities,
@@ -15,7 +16,7 @@ import type {
   RailTransaction,
   SettlementRail,
 } from './index.ts';
-import { type DepositDetails, provisionRefs } from './refs.ts';
+import { type DepositDetails, payeeRefs, provisionRefs } from './refs.ts';
 
 export interface MockRailOptions {
   /** Whether this rail can debit members. Airwallex pooled custody cannot. */
@@ -217,6 +218,11 @@ export class MockRail implements SettlementRail {
       beneficiary: `mockben_${id}`,
       payee: input.beneficiary,
     });
+  }
+
+  /** A pretend payee, one per request. */
+  async addPayee(input: PayeeInput): Promise<Record<string, string>> {
+    return payeeRefs(this.name, `mockben_${hash(input.requestId)}`, input.beneficiary);
   }
 
   parseEvent(rawBody: string): RailEvent {

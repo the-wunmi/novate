@@ -468,6 +468,8 @@ describe('people sign in with accounts', () => {
     ).json()) as { key: string };
     const me = await send('/me', { key });
     expect(me.status).toBe(200);
+    // A machine acting for the member does not see who works there.
+    expect((await send(`${t.base}/members/${m}/users`, { key })).status).toBe(403);
     expect(await me.json()).toMatchObject({
       kind: 'agent',
       tenantId: t.id,

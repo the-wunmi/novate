@@ -16,6 +16,7 @@ import {
   houseOnly,
   memberOrStaff,
   ownMember,
+  ownMemberPeople,
   platformOnly,
   staff,
 } from '../http/guards.ts';
@@ -82,6 +83,16 @@ export function tenantRoutes(app: App, guards: { operator: Guard }) {
     );
     return json(out, out.status === 'pending_approval' ? 202 : 200);
   });
+  // A new payee is created on the rail, and switching to it waits for a second house person.
+  app.post('/tenants/:tenantId/members/:memberId/payee', houseOnly, async (c) => {
+    const out = await engine.changePayee(
+      tenantOf(c),
+      c.get('principal'),
+      c.req.param('memberId'),
+      await input(c),
+    );
+    return json(out, out.status === 'pending_approval' ? 202 : 200);
+  });
   app.post('/tenants/:tenantId/members/:memberId/provision', houseOnly, async (c) => {
     await engine.provisionMember(
       tenantOf(c),
@@ -124,7 +135,7 @@ export function tenantRoutes(app: App, guards: { operator: Guard }) {
     json(await engine.memberAgents(tenantOf(c), memberIdOf(c))),
   );
   // Who of the member can sign in: read only, for the member's own access review.
-  app.get('/tenants/:tenantId/members/:memberId/users', ownMember, async (c) =>
+  app.get('/tenants/:tenantId/members/:memberId/users', ownMemberPeople, async (c) =>
     json(await engine.memberUsers(tenantOf(c), memberIdOf(c))),
   );
   // The member's own controls, set by its own signed-in users; loosening one waits for a second.

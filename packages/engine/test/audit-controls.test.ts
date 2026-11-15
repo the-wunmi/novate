@@ -125,6 +125,8 @@ describe('a reconciliation break', () => {
     brain.current = undefined;
     const w = await makeWorld(main);
     const { run } = await rigBreak(w, 'lifecycle', { stray: eur('3') });
+    // The case opens in its own workflow, after the run returns.
+    const open = await waitForCase(w.tenantId, { subjectId: run.runId });
     expect((await tenantStatus(w.tenantId)).settlementHaltedAt).not.toBeNull();
     expect(run.breaks.map((b) => [b.kind, b.countsAsItem]).sort()).toEqual([
       ['balance_mismatch', false],
@@ -140,13 +142,14 @@ describe('a reconciliation break', () => {
       externalRef: 'stray-lifecycle',
     });
     expect((await reconcile(w.tenantId, 'lifecycle')).status).toBe('clean');
-    const [, broken] = (await reconHistory(w.tenantId, { limit: 2 })).rows;
+    const broken = (await reconHistory(w.tenantId)).rows.find((r) => r.id === run.runId);
     expect(broken?.breaks.map((b) => b.status)).toEqual(['open', 'open']);
     expect(broken?.breaks[0]?.ageSeconds).toBeGreaterThanOrEqual(0);
     expect(await openBreaks(w.tenantId)).toHaveLength(2);
 
-    // The balance mismatch and the item it comes from are one difference, counted once.
-    expect((await openBreaks(w.tenantId)).map((b) => [b.kind, b.countsAsItem])).toEqual([
+    // The balance mismatch and the item it comes from are one difference, counted once. One run's
+    // breaks share a timestamp, so their order is the query plan's.
+    expect((await openBreaks(w.tenantId)).map((b) => [b.kind, b.countsAsItem]).sort()).toEqual([
       ['balance_mismatch', false],
       ['missing_in_ledger', true],
     ]);
@@ -158,7 +161,8 @@ describe('a reconciliation break', () => {
     );
     await expect(resumeSettlement(w.tenantId, w.person, { reason: ' ' })).rejects.toThrow();
 
-    const [balance, item] = broken?.breaks ?? [];
+    const balance = broken?.breaks.find((b) => b.kind === 'balance_mismatch');
+    const item = broken?.breaks.find((b) => b.kind === 'missing_in_ledger');
     await expect(
       resolveBreak(w.tenantId, w.person, balance?.id as string, {
         resolution: 'posted',
@@ -212,7 +216,6 @@ describe('a reconciliation break', () => {
     await expect(resumeSettlement(w.tenantId, w.person, { reason: 'all good' })).rejects.toThrow(
       /waiting for a person/,
     );
-    const open = await waitForCase(w.tenantId, { subjectId: run.runId });
     await personDecides(w, open.id, {
       bindingHash: open.bindingHash,
       action: { type: 'halt_settlement' },

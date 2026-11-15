@@ -21,6 +21,7 @@ import { presetInputs } from '@novate/policy';
 import { AirwallexRail, createMetalClient, MetalRail, RailRegistry } from '@novate/rails';
 import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts';
 import { createApp } from './app.ts';
+import { demoClient } from './demo-client.ts';
 import { ensureDemoUsers } from './demo-users.ts';
 import { authFromEnv } from './env.ts';
 import { fundStablecoinBuyer } from './metal-buyer.ts';
@@ -191,6 +192,11 @@ const app = createApp({
 const server = serve({
   // The node server's bindings carry the socket, which sign-in rate limits key on.
   fetch: async (req: Request, env: unknown) => {
+    // The tunnel exists for Airwallex's webhooks; the demo's known passwords stay on localhost.
+    const { host, pathname } = new URL(req.url);
+    if (host === tunnelHost && !pathname.startsWith('/rails/')) {
+      return new Response('Not found', { status: 404 });
+    }
     const res = await app.fetch(req, env);
     if (new URL(req.url).pathname.startsWith('/rails/') && !res.ok) {
       console.warn(`Refused a webhook: ${res.status} ${await res.clone().text()}`);
@@ -218,45 +224,14 @@ const signIns = () => {
   for (const u of demoUsers) say(`  ${u.role.padEnd(8)} ${u.email}  password ${u.password}`);
 };
 
-async function api<T>(key: string, method: string, path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`http://localhost:${PORT}${path}`, {
-    method,
-    headers: { authorization: `Bearer ${key}`, 'content-type': 'application/json' },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const text = await res.text();
-  if (!res.ok) throw new Error(`${method} ${path} answered ${res.status}: ${text.slice(0, 300)}`);
-  return JSON.parse(text) as T;
-}
+const { api, signIn } = demoClient(`http://localhost:${PORT}`);
 const base = `/tenants/${tenant}`;
 
 /** One of the demo's house people, signed in through the console's own login, acting with that session. */
 async function signedIn(email: string) {
-  const origin = `http://localhost:${PORT}`;
   const user = demoUsers.find((u) => u.email === email);
   if (!user) throw new Error(`No demo user ${email}`);
-  const login = await fetch(`${origin}/auth/login`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-requested-with': 'novate', origin },
-    body: JSON.stringify({ email, password: user.password }),
-  });
-  if (!login.ok) throw new Error(`${email} could not sign in: ${login.status}`);
-  const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0];
-  return async <T>(method: string, path: string, body: unknown): Promise<T> => {
-    const res = await fetch(`${origin}${path}`, {
-      method,
-      headers: {
-        cookie,
-        origin,
-        'x-requested-with': 'novate',
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify(body),
-    });
-    const text = await res.text();
-    if (!res.ok) throw new Error(`${method} ${path} answered ${res.status}: ${text.slice(0, 300)}`);
-    return JSON.parse(text) as T;
-  };
+  return signIn(email, user.password);
 }
 
 /** Where a member is paid: one house person asks and the other approves, as on any installation. */
@@ -530,7 +505,10 @@ try {
   done('Agents may decide cases up to €200,000. Anything larger goes to a person.');
   say(`Open the clearing desk: ${paint(36, consoleUrl)} and sign in as`);
   signIns();
-  if (!process.argv.includes('--no-open')) spawn('open', [consoleUrl]);
+  if (!process.argv.includes('--no-open')) {
+    // `open` is macOS's; elsewhere the link above is enough.
+    spawn('open', [consoleUrl]).on('error', () => undefined);
+  }
 
   await chapter('Businesses join, each with a real Airwallex account');
   const brandId = await member('Homeware brand', 'GBP', { payout: 'wallet' });

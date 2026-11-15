@@ -8,7 +8,7 @@ import {
   parseInput,
 } from '@novate/core';
 import { members, type Tx } from '@novate/db';
-import { isIdentityRefKey, RefKeys } from '@novate/rails';
+import { isIdentityRefKey, type PayeeInput, RefKeys } from '@novate/rails';
 import { and, eq, ne, sql } from 'drizzle-orm';
 import { z } from 'zod';
 import { actorOf, personOf, Reason, ReasonInput, recordControl } from './control.ts';
@@ -275,6 +275,67 @@ async function runProvision(
 }
 
 const provisionWorkflow = DBOS.registerWorkflow(runProvision, { name: 'provisionMember' });
+
+export const ChangePayee = z.object({
+  rail: z.string().min(1),
+  /** The rail's details of where the member is paid from now on. */
+  beneficiary: z.record(z.string(), z.unknown()),
+  transferMethods: z.array(z.enum(['LOCAL', 'SWIFT'])).min(1),
+  /** Same key, same payee. A failed attempt is retried under a new key. */
+  idempotencyKey: z.string().min(1),
+  reason: Reason,
+});
+
+/**
+ * Pay a provisioned member somewhere new. The rail creates the payee first, then switching to it is
+ * held for a second house person like any change of refs (`rail_refs`): a payee nobody approved is
+ * created but never paid.
+ */
+export async function changePayee(
+  tenantId: string,
+  principal: Principal,
+  memberId: string,
+  input: z.input<typeof ChangePayee>,
+): Promise<PendingApproval | { status: 'unchanged' }> {
+  const { rail: railName, idempotencyKey, reason, ...payee } = parseInput(ChangePayee, input);
+  personOf(principal, 'change where a member is paid');
+  const refusal = railRefusal(tenantId, railName);
+  if (refusal) throw new DomainError('invalid', refusal);
+  const rail = deps().rails.get(railName);
+  if (!rail.addPayee || rail.provisionNeeds !== 'beneficiary')
+    throw new DomainError('invalid', `Rail ${railName} takes no payee`);
+  const member = await memberInTenant(deps().db, tenantId, memberId);
+  if (!member.railRefs[RefKeys.beneficiary(railName)]) {
+    throw new DomainError('conflict', `${member.name} has no payee on ${railName}: open accounts`);
+  }
+  const id = stableUuid(`payee:${tenantId}:${member.id}:${idempotencyKey}`);
+  const handle = await DBOS.startWorkflow(payeeWorkflow, { workflowID: id })(
+    tenantId,
+    principal,
+    member.id,
+    railName,
+    { ...payee, requestId: id },
+    reason,
+  );
+  return handle.getResult();
+}
+
+async function runPayeeChange(
+  tenantId: string,
+  principal: Principal,
+  memberId: string,
+  railName: string,
+  payee: PayeeInput,
+  reason: string,
+) {
+  const rail = deps().rails.get(railName);
+  const refs = await networkStep('rail_add_payee', () =>
+    (rail.addPayee as NonNullable<typeof rail.addPayee>)(payee),
+  );
+  return setMemberRailRefs(tenantId, principal, memberId, { refs, reason });
+}
+
+const payeeWorkflow = DBOS.registerWorkflow(runPayeeChange, { name: 'changePayee' });
 
 export function listMembers(tenantId: string) {
   return deps().db.select().from(members).where(eq(members.tenantId, tenantId));

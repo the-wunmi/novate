@@ -157,6 +157,18 @@ export const ownMember = guard(async (c) => {
   return undefined;
 });
 
+/** A member's own people, seen by the member's users and staff: never by its agents' keys. */
+export const ownMemberPeople = guard(async (c) => {
+  const refused = await authenticate(c);
+  if (refused) return refused;
+  const principal = c.get('principal');
+  const allowed =
+    readsAsStaff(principal) ||
+    (principal.kind === 'member' && principal.memberId === c.req.param('memberId'));
+  if (!allowed) throw denied();
+  return undefined;
+});
+
 /** A member's own money, moved by the member, the platform or the house: never by its agents. */
 export const ownMemberMoney = guard(async (c) => {
   const refused = await authenticate(c);

@@ -1,12 +1,12 @@
 import { useState } from 'react';
 import { Link, useLocation } from 'wouter';
-import { api, useAction, usePaged, useTenant } from '../api.ts';
+import { api, type Page, useAction, usePaged, useTenant } from '../api.ts';
 import { dealSummary } from '../describe.tsx';
 import { AllWithdrawals } from '../ops.tsx';
 import { PayInPayOut } from '../pay-details.tsx';
 import { useSession } from '../session.tsx';
 import { StatementPanel } from '../statement.tsx';
-import type { Deal, DefaultFundView, Exposure, User } from '../types.ts';
+import type { Approval, Deal, DefaultFundView, Exposure, User } from '../types.ts';
 import {
   Amounts,
   actorName,
@@ -29,6 +29,13 @@ import {
   until,
 } from '../ui.tsx';
 import { AgentsPanel } from './agents.tsx';
+import {
+  ChangePayout,
+  CreditMember,
+  EditMember,
+  MoveDefaultFund,
+  payeeRails,
+} from './member-forms.tsx';
 import { MemberStatus, sum } from './members.tsx';
 import { OpenAccounts, openableRails } from './open-accounts.tsx';
 
@@ -37,11 +44,13 @@ export function MemberPage({ id, opening = false }: { id: string; opening?: bool
   const { tenantId, agents, canAct, isHouse, rails } = useSession();
   const [, navigate] = useLocation();
   const [opened, setOpened] = useState(opening);
+  const [form, setForm] = useState<null | 'payout' | 'credit'>(null);
   const exposure = useTenant<Exposure>(tenantId, '/exposure');
   const row = exposure.data?.members.find((m) => m.memberId === id);
   if (!row) return exposure.error ? <LoadFailed error={exposure.error} /> : <Loading />;
   const cur = row.currencies;
   const openable = isHouse ? openableRails(rails, row) : [];
+  const payable = isHouse ? payeeRails(rails, row) : [];
   const closeForm = () => {
     setOpened(false);
     if (opening) navigate(`/members/${id}`, { replace: true });
@@ -56,7 +65,16 @@ export function MemberPage({ id, opening = false }: { id: string; opening?: bool
           </>
         }
         title={row.name}
-        actions={canAct && <MemberActions id={id} name={row.name} status={row.status} />}
+        actions={
+          canAct && (
+            <MemberActions
+              id={id}
+              name={row.name}
+              status={row.status}
+              onCredit={isHouse ? () => setForm('credit') : undefined}
+            />
+          )
+        }
         lede={
           <span className="outcome">
             <MemberStatus status={row.status} />
@@ -85,6 +103,7 @@ export function MemberPage({ id, opening = false }: { id: string; opening?: bool
         />
       </div>
       <div className="stack">
+        {form === 'credit' && <CreditMember row={row} onClose={() => setForm(null)} />}
         <Panel title="Exposure by currency">
           <table>
             <thead>
@@ -159,7 +178,22 @@ export function MemberPage({ id, opening = false }: { id: string; opening?: bool
           row={row}
           onOpen={openable.length && !opened ? () => setOpened(true) : undefined}
         />
-        <Panel title="Pay in and pay out">
+        {form === 'payout' && payable.length > 0 && (
+          <ChangePayout row={row} rails={payable} onClose={() => setForm(null)} />
+        )}
+        <Panel
+          title="Pay in and pay out"
+          aside={
+            <span className="toolbar">
+              <PayoutChangeWaiting id={id} />
+              {payable.length > 0 && form !== 'payout' && (
+                <button type="button" className="btn small" onClick={() => setForm('payout')}>
+                  Change payout details
+                </button>
+              )}
+            </span>
+          }
+        >
           <PayInPayOut accounts={row} />
         </Panel>
         <MemberPeople id={id} />
@@ -176,7 +210,17 @@ export function MemberPage({ id, opening = false }: { id: string; opening?: bool
  * What the platform and the house can do to a member: invite its treasurer to its own portal, and
  * stop or restart its trading. Each needs a reason, which goes on the control log.
  */
-function MemberActions({ id, name, status }: { id: string; name: string; status: string }) {
+function MemberActions({
+  id,
+  name,
+  status,
+  onCredit,
+}: {
+  id: string;
+  name: string;
+  status: string;
+  onCredit?: () => void;
+}) {
   const { tenantId, isHouse } = useSession();
   const [asking, setAsking] = useState<null | 'suspend' | 'reinstate' | 'invite'>(null);
   const [reason, setReason] = useState('');
@@ -283,6 +327,11 @@ function MemberActions({ id, name, status }: { id: string; name: string; status:
     );
   return (
     <span className="toolbar">
+      {onCredit && (
+        <button type="button" className="btn" onClick={onCredit}>
+          Credit member…
+        </button>
+      )}
       <button type="button" className="btn" onClick={() => setAsking('invite')}>
         Invite to the portal
       </button>
@@ -305,12 +354,41 @@ function MemberActions({ id, name, status }: { id: string; name: string; status:
  * then this fund, then the house: so who put in what, and what was drawn, belongs on show.
  */
 export function DefaultFund() {
-  const { tenantId } = useSession();
+  const { tenantId, isHouse, members } = useSession();
+  const [moving, setMoving] = useState<null | 'contribute' | 'withdraw'>(null);
   const fund = useTenant<DefaultFundView>(tenantId, '/default-fund');
   const f = fund.data;
   if (!f) return null;
+  const currencies = [
+    ...new Set([...f.contributions.map((c) => c.currency), ...members.map((m) => m.homeCurrency)]),
+  ];
   return (
-    <Panel title="Default fund" aside={<Amounts list={f.balances} zeros />}>
+    <Panel
+      title="Default fund"
+      aside={
+        <span className="toolbar">
+          <Amounts list={f.balances} zeros />
+          {isHouse && !moving && (
+            <>
+              <button type="button" className="btn small" onClick={() => setMoving('contribute')}>
+                Contribute…
+              </button>
+              <button type="button" className="btn small" onClick={() => setMoving('withdraw')}>
+                Withdraw…
+              </button>
+            </>
+          )}
+        </span>
+      }
+    >
+      {moving && (
+        <MoveDefaultFund
+          key={moving}
+          direction={moving}
+          currencies={currencies}
+          onClose={() => setMoving(null)}
+        />
+      )}
       <table>
         <thead>
           <tr>
@@ -396,6 +474,7 @@ function MemberDetails({
   onOpen?: () => void;
 }) {
   const { tenantId, me } = useSession();
+  const [editing, setEditing] = useState(false);
   const asks = useTenant<
     { memberId: string; requestedAt: string; requestedBy: Parameters<typeof actorName>[0] }[]
   >(tenantId, '/provision-requests', { enabled: row.provisioned === false });
@@ -408,25 +487,33 @@ function MemberDetails({
     <Panel
       title="Details"
       aside={
-        onOpen ? (
-          <button type="button" className="btn small" onClick={onOpen}>
-            Open accounts
-          </button>
-        ) : (
-          row.provisioned === false &&
-          me.kind === 'platform' && (
-            <button
-              type="button"
-              className="btn small"
-              disabled={ask.isPending}
-              onClick={() => ask.mutate()}
-            >
-              Ask the house to open accounts
+        <span className="toolbar">
+          {me.kind === 'platform' && !editing && (
+            <button type="button" className="btn small" onClick={() => setEditing(true)}>
+              Edit
             </button>
-          )
-        )
+          )}
+          {onOpen ? (
+            <button type="button" className="btn small" onClick={onOpen}>
+              Open accounts
+            </button>
+          ) : (
+            row.provisioned === false &&
+            me.kind === 'platform' && (
+              <button
+                type="button"
+                className="btn small"
+                disabled={ask.isPending}
+                onClick={() => ask.mutate()}
+              >
+                Ask the house to open accounts
+              </button>
+            )
+          )}
+        </span>
       }
     >
+      {editing && <EditMember row={row} onClose={() => setEditing(false)} />}
       <dl className="facts panel-body">
         <dt>Legal name</dt>
         <dd>{row.legalName ?? '—'}</dd>
@@ -451,6 +538,18 @@ function MemberDetails({
       </dl>
     </Panel>
   );
+}
+
+/** A change of where this member is paid, still waiting for a second house person. */
+function PayoutChangeWaiting({ id }: { id: string }) {
+  const { tenantId } = useSession();
+  const held = useTenant<Page<Approval<{ memberId?: string }>>>(
+    tenantId,
+    '/approvals?kind=rail_refs',
+    { live: true },
+  );
+  if (!held.data?.rows.some((a) => a.payload.memberId === id)) return null;
+  return <Pill tone="wait">Change waiting for approval</Pill>;
 }
 
 function MemberDeals({ id }: { id: string }) {

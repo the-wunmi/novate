@@ -8,9 +8,12 @@ import { eq } from 'drizzle-orm';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { deps } from '../src/deps.ts';
 import {
+  approveRequest,
+  changePayee,
   dealEventFeed,
   ingestRailEvent,
   type launchEngine,
+  listApprovals,
   memberMargin,
   memberStatement,
   monitorWorkflow,
@@ -34,6 +37,7 @@ import {
   netProgram,
   notified,
   notifierOutage,
+  provisionEurMember,
   reconcile,
   sent,
   shutdown,
@@ -429,6 +433,73 @@ describe('work that must survive a failure', () => {
       delete provisionable.provision;
       delete deps().railOwners.orphans;
     }
+  });
+});
+
+describe('changing where a member is paid', () => {
+  const payee = (key = randomUUID()) => ({
+    rail: 'mock',
+    transferMethods: ['LOCAL'] as ('LOCAL' | 'SWIFT')[],
+    idempotencyKey: key,
+    reason: 'Supplier changed bank',
+    beneficiary: {
+      bank_details: {
+        account_currency: 'EUR',
+        account_name: 'Dutch retailer',
+        bank_name: 'ING',
+        iban: 'NL69INGB0123456789',
+      },
+    },
+  });
+  const refsOf = async (memberId: string) =>
+    (await engine.db.select().from(members).where(eq(members.id, memberId)))[0]?.railRefs;
+
+  it('creates the payee on the rail and switches to it once a second person approves', async () => {
+    const w = await makeWorld(rail, { net });
+    await provisionEurMember(w, w.retailer);
+    const before = await refsOf(w.retailer);
+    const input = payee();
+    const out = await changePayee(w.tenantId, w.house, w.retailer, input);
+    expect(out).toMatchObject({ status: 'pending_approval', kind: 'rail_refs' });
+    // The same attempt again is the same request, not a second payee.
+    expect(await changePayee(w.tenantId, w.house, w.retailer, input)).toEqual(out);
+    const held = await listApprovals(w.tenantId, null, { kind: 'rail_refs' });
+    expect(held.rows).toHaveLength(1);
+    expect(await refsOf(w.retailer)).toEqual(before);
+    if (out.status !== 'pending_approval') throw new Error('not held');
+    await approveRequest(w.tenantId, w.checker, out.approvalId);
+    const after = await refsOf(w.retailer);
+    expect(after?.mock_beneficiary).not.toBe(before?.mock_beneficiary);
+    expect(after?.mock_payout_label).toBe('ING ••••6789');
+    expect(after?.mock_deposit_account).toBe(before?.mock_deposit_account);
+  });
+
+  it('asks nothing when the rail refuses the payee, a key asks, or there is no payee yet', async () => {
+    const w = await makeWorld(rail, { net });
+    await expect(changePayee(w.tenantId, w.house, w.retailer, payee())).rejects.toMatchObject({
+      code: 'conflict',
+    });
+    await provisionEurMember(w, w.retailer);
+    const before = await refsOf(w.retailer);
+    await expect(
+      changePayee(w.tenantId, { ...w.house, userId: undefined }, w.retailer, payee()),
+    ).rejects.toMatchObject({ code: 'person_required' });
+    const refused = vi
+      .spyOn(rail, 'addPayee')
+      .mockRejectedValueOnce(new DomainError('rail_refused', 'Bank details refused'));
+    try {
+      await expect(changePayee(w.tenantId, w.house, w.retailer, payee())).rejects.toMatchObject({
+        code: 'rail_refused',
+      });
+    } finally {
+      refused.mockRestore();
+    }
+    expect((await listApprovals(w.tenantId, null, { kind: 'rail_refs' })).rows).toEqual([]);
+    expect(await refsOf(w.retailer)).toEqual(before);
+    // A new attempt after the refusal goes through.
+    expect(await changePayee(w.tenantId, w.house, w.retailer, payee())).toMatchObject({
+      status: 'pending_approval',
+    });
   });
 });
 

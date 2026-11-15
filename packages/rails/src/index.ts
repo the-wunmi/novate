@@ -82,6 +82,14 @@ export interface ProvisionInput {
   transferMethods: ('LOCAL' | 'SWIFT')[];
 }
 
+export interface PayeeInput {
+  /** Same request, same payee: a rail that keys creation on it makes one only. */
+  requestId: string;
+  /** Rail-specific details of where the member is paid. */
+  beneficiary: Record<string, unknown>;
+  transferMethods: ('LOCAL' | 'SWIFT')[];
+}
+
 export interface RailPoll {
   events: RailEvent[];
   cursor: bigint;
@@ -189,6 +197,8 @@ export interface SettlementRail {
   provision?(input: ProvisionInput): Promise<Record<string, string>>;
   /** Which of `ProvisionInput`'s details `provision` needs. Present with `provision`. */
   readonly provisionNeeds?: 'beneficiary' | 'connectedAccount';
+  /** Create a new payee for a member already provisioned, returning its refs. Pooled custody. */
+  addPayee?(input: PayeeInput): Promise<Record<string, string>>;
   /** For rails with no webhooks: what has happened since a cursor, in finalized form only. */
   pollEvents?(cursor: bigint | null): Promise<RailPoll>;
   /** Verify a webhook against its signature. Throws when the signature is wrong. */

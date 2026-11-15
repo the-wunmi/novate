@@ -56,12 +56,23 @@ export function provisionRefs(
     payee: Record<string, unknown> | undefined;
   },
 ): Record<string, string> {
-  const label = payoutLabelOf(opened.payee);
-  const payoutCurrency = payoutCurrencyOf(opened.payee);
   return {
     [RefKeys.depositAccount(rail)]: opened.depositAccount,
     [RefKeys.depositDetails(rail)]: JSON.stringify(opened.details),
-    [RefKeys.beneficiary(rail)]: opened.beneficiary,
+    ...payeeRefs(rail, opened.beneficiary, opened.payee),
+  };
+}
+
+/** The refs of a payee a rail created: its id, and a masked note of where payouts go. */
+export function payeeRefs(
+  rail: string,
+  beneficiary: string,
+  payee: Record<string, unknown> | undefined,
+): Record<string, string> {
+  const label = payoutLabelOf(payee);
+  const payoutCurrency = payoutCurrencyOf(payee);
+  return {
+    [RefKeys.beneficiary(rail)]: beneficiary,
     ...(label ? { [RefKeys.payoutLabel(rail)]: label } : {}),
     ...(payoutCurrency ? { [RefKeys.payoutCurrency(rail)]: payoutCurrency } : {}),
   };
