@@ -48,7 +48,7 @@ development database, and two-step sign-in is turned off there.
 ## On real systems
 
 `pnpm demo:live` runs the whole product, narrated, on its own fresh `novate_demo` database, and opens
-the console beside it. It needs, in `.env`: Airwallex sandbox keys (`AIRWALLEX_CLIENT_ID`,
+the console beside it. It needs, in `.env` (copied from `.env.example`): Airwallex sandbox keys (`AIRWALLEX_CLIENT_ID`,
 `AIRWALLEX_API_KEY`), `ANTHROPIC_API_KEY`, `NOVATE_SECRET_KEY`, and optionally Alta testnet
 (`METAL_RPC_URL`, `METAL_PRIVATE_KEY`). It also needs `cloudflared` for Airwallex's webhooks. Add
 `--step` to pause at each chapter, and `--no-open` to keep it from opening the console with macOS's
@@ -68,6 +68,54 @@ It proves that agents can run real financial workflows with no person on any tra
 9. **Card funding**: a buyer pays by card through Airwallex payment acceptance, and the books still match.
 10. **Stablecoin on Alta** (when configured): a buyer pays over x402, credited only after on-chain finality.
 11. **Switch programs**: the same agents move to net settlement with no prefunding; one payment settles both deals.
+
+## Run your own installation
+
+```sh
+pnpm install
+cp .env.example .env    # then set NOVATE_SECRET_KEY: openssl rand -base64 32
+pnpm db:up
+docker compose exec -T postgres psql -U novate -c "create database novate_dbos"   # first run only
+pnpm db:migrate
+pnpm dev:api            # http://localhost:4000, console at /console after `pnpm build:console`
+pnpm dev:console        # or the console with live reload at http://localhost:5173/console
+```
+
+The first boot creates the operator key, a default tenant and its platform key, and invites a first
+house and platform user (`NOVATE_ADMIN_EMAIL`, `NOVATE_PLATFORM_ADMIN_EMAIL`). It prints the keys and
+the invite links once: open a link to set that person's password. If nobody can sign in, `pnpm
+user:invite <email> house` prints a new link; `pnpm reset-operator-key` replaces a lost operator key.
+
+Rails switch on from `.env`: Airwallex with `AIRWALLEX_CLIENT_ID` and `AIRWALLEX_API_KEY`, Alta with
+`METAL_RPC_URL` and `METAL_PRIVATE_KEY`, and the AI with `ANTHROPIC_API_KEY`. Without any of them,
+`NOVATE_ALLOW_MOCK_RAIL=true` gives a rail with no money behind it, for local development only.
+Airwallex webhooks need a public HTTPS address: `pnpm webhook:register https://<your host>` registers
+it and saves the signing secret into `.env` (novate also polls, so a missed webhook loses nothing).
+
+From there, in the console: the platform publishes a program and adds members and their agents, the
+house opens each member's Airwallex accounts, and agents trade over MCP at `/mcp` with their keys.
+People and a business's own systems can trade through the same API with member keys.
+
+## Deploy
+
+Set in `.env`, besides the rail and AI keys: `POSTGRES_PASSWORD` and `NOVATE_APP_DB_PASSWORD`
+(random), `NOVATE_SECRET_KEY`, `NOVATE_PUBLIC_URL=https://<your host>` and `NOVATE_TRUST_PROXY_HOPS`
+(1 behind one proxy). Then, the first time, create the `novate_dbos` database and the `novate_app`
+login role with that password before starting the server:
+
+```sh
+docker compose up -d --wait postgres
+docker compose exec -T postgres psql -U novate -c "create database novate_dbos"
+docker compose exec -T postgres psql -U novate -c "create role novate_app login password '<NOVATE_APP_DB_PASSWORD>'"
+docker compose --profile app up -d --build
+```
+
+This runs Postgres and the server, bound to `127.0.0.1:4500` for a reverse proxy that terminates
+HTTPS. The server runs as `novate_app`, a database role that can only read and append to the audit
+tables; boot migrates and grants through the owner's connection. The first boot's keys and invite
+links are in `docker compose logs api`. Then register the Airwallex webhook against the public URL
+and run `docker compose --profile app up -d` again so the server reads the new secret. Run one server
+per Airwallex account: two would each see the other's money as an unexplained difference.
 
 ## How it works
 
@@ -97,13 +145,16 @@ Safety properties:
   what the decider was shown, plus model, prompt version and prompt hash. If the evidence changes, the
   case reopens. Autonomy can be earned: a model's share of the ceiling follows its judged track record.
 - **Four eyes.** People sign in with accounts (keys are for machines). Manual credits, large
-  write-offs, a person's decisions above the ceiling and new rail openings wait for a second person.
+  write-offs, payee changes, a person's decisions above the ceiling and new rail openings wait for a
+  second person.
 - **Reconciliation halts settlement.** Any difference with the rail stops settlement on it until a
   person resolves it.
 - **Append-only audit, enforced by the database.** Ledger transfers, deal events, decision records and
-  control events refuse UPDATE, DELETE and TRUNCATE by trigger; mutable tables keep their history.
+  control events refuse UPDATE, DELETE and TRUNCATE by trigger; settlement instructions, FX
+  conversions and rail events, which still change, keep every old version.
 - **Durable workflows with idempotency.** Everything with an outside effect runs in a DBOS workflow;
-  rail calls are guarded against double sends by idempotency keys, and a payment with no answer is
+  rail calls are guarded against double sends by idempotency keys (on Alta, which has none, by a
+  record of each send attempt), and a payment with no answer is
   never assumed failed.
 
 Trading agents connect to `/mcp` with an API key. They can open deals, file evidence and read their
