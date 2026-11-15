@@ -15,8 +15,15 @@ const history = (
   o: Partial<Record<'buyerAgent' | 'buyer' | 'seller', Record<string, number>>> = {},
 ) => ({
   buyerAgent: { dealCount: 0, medianQuantity: 0, medianAmount: 0, ...o.buyerAgent },
-  buyer: { completedDeals: 0, defaults: 0, ...o.buyer },
-  seller: { completedDeals: 0, onTimeRate: 1, defectRate: 0, ...o.seller },
+  buyer: { completedDeals: 0, counterparties: 0, defaults: 0, ...o.buyer },
+  seller: {
+    completedDeals: 0,
+    onTimeRate: 1,
+    defectRate: 0,
+    pricedDeals: 0,
+    medianUnitPrice: 0,
+    ...o.seller,
+  },
 });
 
 const ctx = (over: Partial<RuleContext> = {}): RuleContext => ({
@@ -60,10 +67,19 @@ describe('resolvePolicy', () => {
     const r = resolvePolicy(
       presets.tradeAssurance,
       ctx({
-        signals: { history: history({ buyer: { completedDeals: 12 } }), fx: { vol30d: 0.05 } },
+        signals: {
+          history: history({ buyer: { completedDeals: 12, counterparties: 4 } }),
+          fx: { vol30d: 0.05 },
+        },
       }),
     );
-    expect(r.policy.funding).toEqual({ mode: 'partial', bps: 2_000, timeout: '72h' });
+    expect(r.policy.funding).toEqual({
+      mode: 'partial',
+      bps: 2_000,
+      timeout: '72h',
+      currency: 'home',
+      fxBufferBps: 300,
+    });
     expect(r.fundingBps).toBe(2_000);
     expect(r.overridesApplied.map((o) => o.id)).toEqual(['trusted_buyer_partial']);
   });
@@ -164,7 +180,12 @@ describe('release conditions (mug scenario)', () => {
     const blocked = evaluateCondition(condition, base(facts));
     expect(blocked.state).toBe('blocked');
     expect(blocked.findings[0]?.code).toBe('bill_of_lading.shipment_late');
-    facts.push(fact('waiver', 'buyer', { code: 'bill_of_lading.shipment_late' }));
+    facts.push(
+      fact('waiver', 'buyer', {
+        code: 'bill_of_lading.shipment_late',
+        factId: blocked.findings[0]?.factId,
+      }),
+    );
     expect(evaluateCondition(condition, base(facts)).state).toBe('satisfied');
   });
 

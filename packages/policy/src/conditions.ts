@@ -1,5 +1,7 @@
 import { applyBps, maxBig, minBig } from '@novate/core';
+import { z } from 'zod';
 import { evalCelBool, evalCelInt } from './cel.ts';
+import { customConditions } from './condition-registry.ts';
 import { durationMs } from './duration.ts';
 import type { AmountRule, ConditionNode } from './schema.ts';
 import { DocumentMatch } from './schema.ts';
@@ -66,8 +68,11 @@ const factsOf = (ctx: ConditionContext, kind: string, type?: string) =>
 
 const latest = (facts: Fact[]) => facts.at(-1);
 
-function waived(ctx: ConditionContext, code: string): boolean {
-  return factsOf(ctx, 'waiver').some((f) => f.data.code === code);
+/** A waiver covers one finding on one piece of evidence, so a worse replacement is not waived. */
+function waived(ctx: ConditionContext, finding: Finding): boolean {
+  return factsOf(ctx, 'waiver').some(
+    (f) => f.data.code === finding.code && f.data.factId === finding.factId,
+  );
 }
 
 function daysBetween(a: string, b: string): number {
@@ -85,6 +90,20 @@ const builtins: Record<string, ConditionEvaluator> = {
     for (const type of n.require) {
       const doc = latest(factsOf(ctx, 'document', type)) as Fact;
       const fields = (doc.data.fields ?? {}) as Record<string, unknown>;
+
+      // Evidence nobody could read is a finding. It must never pass as a match.
+      const needed = match.requireFields[type] ?? [];
+      const absent = needed.filter((k) => fields[k] === undefined);
+      if (Object.keys(fields).length === 0 || absent.length) {
+        findings.push({
+          code: `${type}.unreadable`,
+          message: absent.length
+            ? `${type} is missing ${absent.join(', ')}`
+            : `${type} has no readable fields`,
+          factId: doc.id,
+          waivable: true,
+        });
+      }
 
       if (typeof fields.shipmentDate === 'string' && ctx.deal.shipmentDate) {
         const late = daysBetween(ctx.deal.shipmentDate, fields.shipmentDate);
@@ -108,8 +127,16 @@ const builtins: Record<string, ConditionEvaluator> = {
           });
         }
       }
-      if (fields.amount !== undefined) {
-        const amt = BigInt(fields.amount as string | number);
+      const amt = parseAmount(fields.amount);
+      if (fields.amount !== undefined && amt === undefined) {
+        findings.push({
+          code: `${type}.amount_invalid`,
+          message: `${type} amount is not a whole number of minor units`,
+          factId: doc.id,
+          waivable: false,
+        });
+      }
+      if (amt !== undefined) {
         const diff = amt > ctx.deal.amount ? amt - ctx.deal.amount : ctx.deal.amount - amt;
         if (Number(diff * 10_000n) / Number(ctx.deal.amount) / 100 > match.amountTolerancePct) {
           findings.push({
@@ -129,11 +156,16 @@ const builtins: Record<string, ConditionEvaluator> = {
         });
       }
       for (const issue of (doc.data.issues ?? []) as { code: string; message: string }[]) {
-        findings.push({ ...issue, code: `${type}.${issue.code}`, factId: doc.id, waivable: true });
+        findings.push({
+          ...issue,
+          code: `${type}.${issue.code}`,
+          factId: doc.id,
+          waivable: issue.code !== 'embedded_instructions',
+        });
       }
     }
 
-    const open = findings.filter((f) => !(f.waivable && waived(ctx, f.code)));
+    const open = findings.filter((f) => !(f.waivable && waived(ctx, f)));
     if (open.length) {
       return { state: 'blocked', findings: open, trace: open.map((f) => f.message) };
     }
@@ -152,7 +184,7 @@ const builtins: Record<string, ConditionEvaluator> = {
         factId: fact.id,
         waivable: true,
       };
-      if (waived(ctx, finding.code)) return ok('inspection: below threshold, waived');
+      if (waived(ctx, finding)) return ok('inspection: below threshold, waived');
       return { state: 'blocked', findings: [finding], trace: [finding.message] };
     }
     return ok(`inspection: ${(rate * 100).toFixed(1)}% passed`);
@@ -210,6 +242,14 @@ const custom = new Map<string, ConditionEvaluator>();
 export function registerCondition(type: string, evaluator: ConditionEvaluator): void {
   if (type in builtins) throw new Error(`Cannot override built-in condition ${type}`);
   custom.set(type, evaluator);
+  customConditions.add(type);
+}
+
+function parseAmount(v: unknown): bigint | undefined {
+  if (typeof v === 'bigint') return v;
+  if (typeof v === 'number' && Number.isInteger(v)) return BigInt(v);
+  if (typeof v === 'string' && /^-?\d+$/.test(v)) return BigInt(v);
+  return undefined;
 }
 
 export function evaluateCondition(node: ConditionNode, ctx: ConditionContext): ConditionResult {
@@ -263,9 +303,13 @@ function combine(results: ConditionResult[], state: ConditionState): ConditionRe
 
 export function passRate(fact: Fact): number {
   const d = fact.data as { passRate?: number; inspected?: number; passed?: number };
-  if (typeof d.passRate === 'number') return d.passRate;
-  if (d.inspected && typeof d.passed === 'number') return d.passed / d.inspected;
-  return 0;
+  const raw =
+    typeof d.passRate === 'number'
+      ? d.passRate
+      : d.inspected && typeof d.passed === 'number'
+        ? d.passed / d.inspected
+        : 0;
+  return Number.isFinite(raw) ? Math.min(1, Math.max(0, raw)) : 0;
 }
 
 export function releaseAmount(rule: AmountRule, ctx: ConditionContext): bigint {
@@ -276,7 +320,7 @@ export function releaseAmount(rule: AmountRule, ctx: ConditionContext): bigint {
       const fact = latest(factsOf(ctx, 'inspection'));
       if (!fact) return ctx.deal.amount;
       const bps = Math.round(passRate(fact) * 10_000);
-      return applyBps(ctx.deal.amount, bps);
+      return minBig(maxBig(applyBps(ctx.deal.amount, bps), 0n), ctx.deal.amount);
     }
     case 'cel': {
       const out = evalCelInt(rule.expr, celContext(ctx));
@@ -294,4 +338,49 @@ function celContext(ctx: ConditionContext): Record<string, unknown> {
     facts: ctx.facts.map((f) => ({ kind: f.kind, type: f.type, source: f.source, data: f.data })),
     inspection: inspection ? { passRate: passRate(inspection), ...inspection.data } : null,
   };
+}
+
+const InspectionData = z
+  .object({
+    passRate: z.number().min(0).max(1).optional(),
+    inspected: z.int().positive().optional(),
+    passed: z.int().min(0).optional(),
+  })
+  .loose()
+  .refine(
+    (d) => d.passRate !== undefined || (d.inspected !== undefined && d.passed !== undefined),
+    {
+      message: 'Inspection needs passRate, or inspected and passed',
+    },
+  )
+  .refine((d) => d.inspected === undefined || d.passed === undefined || d.passed <= d.inspected, {
+    message: 'Passed cannot exceed inspected',
+  });
+
+const DocumentData = z
+  .object({
+    fields: z
+      .object({
+        amount: z.union([z.int().min(0), z.string().regex(/^\d+$/)]).optional(),
+        quantity: z.number().min(0).optional(),
+        currency: z.string().optional(),
+        shipmentDate: z.iso.date().optional(),
+      })
+      .loose()
+      .optional(),
+    issues: z.array(z.object({ code: z.string(), message: z.string() })).optional(),
+  })
+  .loose();
+
+const FACT_SCHEMAS: Record<string, z.ZodType> = {
+  inspection: InspectionData,
+  document: DocumentData,
+};
+
+/** Reject malformed evidence at the door, so it can never reach a running workflow. */
+export function validateFactData(kind: string, data: unknown): string | null {
+  const schema = FACT_SCHEMAS[kind];
+  if (!schema) return null;
+  const parsed = schema.safeParse(data);
+  return parsed.success ? null : parsed.error.issues.map((i) => i.message).join('; ');
 }

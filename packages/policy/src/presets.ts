@@ -10,7 +10,7 @@ export const presetInputs = {
     name: 'Trade assurance',
     description: 'Buyer prefunds; funds release when documents match and goods pass inspection.',
     signals: ['history', 'fx'],
-    funding: { mode: 'prefunded', timeout: '72h' },
+    funding: { mode: 'prefunded', timeout: '72h', currency: 'home', fxBufferBps: 300 },
     margin: {
       mode: 'scored',
       baseBps: 500,
@@ -43,9 +43,9 @@ export const presetInputs = {
       },
       {
         id: 'price_below_list',
-        when: 'has(deal.attributes.sellerListUnitPrice) && double(deal.unitPrice) < 0.5 * double(deal.attributes.sellerListUnitPrice)',
+        when: '(signals.history.seller.pricedDeals >= 3.0 && double(deal.unitPrice) < 0.5 * signals.history.seller.medianUnitPrice) || (has(deal.attributes.sellerListUnitPrice) && double(deal.unitPrice) < 0.5 * double(deal.attributes.sellerListUnitPrice))',
         action: 'freeze',
-        reason: "Price is less than half the seller's own list price",
+        reason: 'Price is less than half what this seller usually charges',
       },
     ],
     release: {
@@ -54,7 +54,14 @@ export const presetInputs = {
           {
             type: 'documents',
             require: ['commercial_invoice', 'packing_list', 'bill_of_lading'],
-            match: { shipmentDateLateDays: 3 },
+            match: {
+              shipmentDateLateDays: 3,
+              requireFields: {
+                commercial_invoice: ['amount', 'currency', 'quantity'],
+                packing_list: ['quantity'],
+                bill_of_lading: ['shipmentDate'],
+              },
+            },
           },
           { type: 'inspection', minPassRate: 0.8 },
           { type: 'no_dispute' },
@@ -65,12 +72,21 @@ export const presetInputs = {
       onTimeout: 'escalate',
       onBlocked: 'escalate',
     },
-    settlement: { netting: 'multilateral', rail: 'mock' },
+    settlement: {
+      netting: 'multilateral',
+      rail: 'airwallex',
+      timing: { mode: 'cycle', every: '1d' },
+    },
+    // The house is counterparty to both sides, so it pays even if a net debtor does not.
+    risk: { bearer: 'principal' },
+    decisions: {
+      ceiling: { EUR: 5_000_000, GBP: 5_000_000, USD: 5_000_000 },
+    },
     overrides: [
       {
         id: 'trusted_buyer_partial',
-        when: 'signals.history.buyer.completedDeals >= 10.0 && signals.history.buyer.defaults == 0.0',
-        set: { funding: { mode: 'partial', bps: 2_000 } },
+        when: 'signals.history.buyer.completedDeals >= 10.0 && signals.history.buyer.counterparties >= 3.0 && signals.history.buyer.defaults == 0.0',
+        set: { funding: { mode: 'partial', bps: 2_000, currency: 'home', fxBufferBps: 300 } },
         reason: 'Buyer has a clean record: lock 20% up front',
       },
     ],
@@ -89,7 +105,8 @@ export const presetInputs = {
       amount: { type: 'full' },
       onBlocked: 'escalate',
     },
-    settlement: { netting: 'multilateral', rail: 'mock' },
+    settlement: { netting: 'multilateral', rail: 'airwallex' },
+    decisions: { ceiling: { EUR: 5_000_000, GBP: 5_000_000, USD: 5_000_000 } },
     overrides: [
       {
         id: 'new_buyer_prefund',
@@ -98,6 +115,126 @@ export const presetInputs = {
         reason: 'New buyers prefund until they build a record',
       },
     ],
+  },
+
+  /** Marketplace payouts with a reserve that follows each seller's record, in both directions. */
+  marketplaceSettlement: {
+    name: 'Marketplace settlement',
+    description:
+      'Sellers hold a risk-based reserve, proceeds net each cycle, agents earn their limits.',
+    signals: ['history', 'fx'],
+    funding: { mode: 'prefunded', timeout: '72h' },
+    margin: {
+      mode: 'scored',
+      baseBps: 500,
+      minBps: 100,
+      maxBps: 2_000,
+      adjustments: [
+        {
+          when: 'signals.history.seller.completedDeals >= 3.0 && signals.history.seller.defectRate > 0.05',
+          addBps: 500,
+          reason: 'seller has a high defect rate',
+        },
+        {
+          when: 'signals.history.seller.completedDeals >= 20.0 && signals.history.seller.defectRate < 0.01',
+          addBps: -300,
+          reason: 'seller has a long clean record',
+        },
+      ],
+    },
+    release: {
+      condition: {
+        all: [
+          { any: [{ type: 'acceptance' }, { type: 'elapsed', after: '14d' }] },
+          { type: 'no_dispute' },
+        ],
+      },
+      onBlocked: 'escalate',
+    },
+    settlement: {
+      netting: 'multilateral',
+      rail: 'airwallex',
+      timing: { mode: 'cycle', every: '1d' },
+    },
+    treasury: { mode: 'agent' },
+    decisions: {
+      ceiling: { EUR: 5_000_000, GBP: 5_000_000, USD: 5_000_000 },
+      autonomy: { mode: 'earned' },
+    },
+  },
+
+  /** Parties use novate to check a deal and its evidence, then settle somewhere else. */
+  verificationOnly: {
+    name: 'Verification only',
+    description: 'Checks authority and evidence and records the result. Moves no money.',
+    signals: ['history'],
+    funding: { mode: 'net_then_fund' },
+    release: {
+      condition: {
+        all: [
+          {
+            type: 'documents',
+            require: ['commercial_invoice', 'bill_of_lading'],
+            match: { shipmentDateLateDays: 3 },
+          },
+          { type: 'no_dispute' },
+        ],
+      },
+      onBlocked: 'escalate',
+    },
+    settlement: { mode: 'verify_only', rail: 'airwallex' },
+    decisions: { ceiling: { EUR: 5_000_000, GBP: 5_000_000, USD: 5_000_000 } },
+  },
+
+  /** Agents buying from each other: locked on agreement, paid the moment the buyer accepts. */
+  realtimeAgentClearing: {
+    name: 'Real-time agent clearing',
+    description: 'Buyer agent locks funds up front and each deal settles alone on release.',
+    signals: ['history'],
+    funding: { mode: 'prefunded', timeout: '15m' },
+    checks: [
+      {
+        id: 'amount_spike',
+        when: 'signals.history.buyerAgent.dealCount >= 5.0 && double(deal.amount) > 10.0 * signals.history.buyerAgent.medianAmount',
+        action: 'freeze',
+        reason: 'Purchase is far larger than this agent usually makes',
+      },
+    ],
+    release: {
+      condition: { any: [{ type: 'acceptance' }, { type: 'elapsed', after: '1h' }] },
+      recheckEvery: '1m',
+      timeout: '2h',
+      onTimeout: 'release',
+      onBlocked: 'escalate',
+    },
+    settlement: {
+      netting: 'gross',
+      rail: 'airwallex',
+      timing: { mode: 'immediate' },
+      confirmWithin: '1h',
+    },
+    decisions: { ceiling: { EUR: 100_000, GBP: 100_000, USD: 100_000 } },
+  },
+
+  /** The house stands behind every released trade, secured by collateral and a mutual fund. */
+  centralCounterparty: {
+    name: 'Central counterparty',
+    description: 'Members post portfolio margin. If one fails, its collateral and the fund pay.',
+    signals: ['history', 'fx'],
+    funding: { mode: 'net_then_fund' },
+    portfolioMargin: { mode: 'required', baseBps: 500 },
+    risk: { bearer: 'principal', defaultFund: true },
+    release: {
+      condition: { any: [{ type: 'acceptance' }, { type: 'elapsed', after: '14d' }] },
+      onBlocked: 'escalate',
+    },
+    settlement: {
+      netting: 'multilateral',
+      rail: 'airwallex',
+      timing: { mode: 'cycle', every: '1d' },
+      fundingWindow: '4h',
+    },
+    decisions: { ceiling: { EUR: 5_000_000, GBP: 5_000_000, USD: 5_000_000 } },
   },
 } satisfies Record<string, ProgramSpecInput>;
 

@@ -1,8 +1,8 @@
 import { type Db, dealEvents, deals, settlementInstructions } from '@novate/db';
 import type { SignalProvider, SignalSubject } from '@novate/signals';
-import { and, eq, inArray, ne, notInArray, sql } from 'drizzle-orm';
+import { and, eq, inArray, isNotNull, ne, notInArray, sql } from 'drizzle-orm';
 
-const LIVE = ['submitted', 'rejected', 'cancelled', 'refunded'] as const;
+const NOT_COMPLETED = ['submitted', 'rejected', 'cancelled', 'refunded'] as const;
 
 /**
  * Built-in `history` signal: what the clearing house already knows about the parties.
@@ -11,10 +11,10 @@ const LIVE = ['submitted', 'rejected', 'cancelled', 'refunded'] as const;
 export class HistorySignalProvider implements SignalProvider {
   readonly name = 'history';
 
-  constructor(private readonly db: () => Db) {}
+  constructor(private readonly database: Db) {}
 
   async resolve(s: SignalSubject) {
-    const db = this.db();
+    const db = this.database;
     const excludeSelf = s.dealId ? ne(deals.id, s.dealId) : undefined;
 
     const buyerAgent = s.buyerAgentId
@@ -28,17 +28,28 @@ export class HistorySignalProvider implements SignalProvider {
           .where(
             and(
               eq(deals.buyerAgentId, s.buyerAgentId),
-              notInArray(deals.status, [...LIVE]),
+              notInArray(deals.status, [...NOT_COMPLETED]),
               excludeSelf,
             ),
           )
           .then((r) => r[0])
       : undefined;
 
+    // Verification-only deals move no money, so they prove nothing about paying. Wash trades with
+    // one friend would inflate a raw count, so rules can also read distinct counterparties.
     const [buyer] = await db
-      .select({ completedDeals: sql<number>`count(*)::float8` })
+      .select({
+        completedDeals: sql<number>`count(*)::float8`,
+        counterparties: sql<number>`count(distinct ${deals.sellerMemberId})::float8`,
+      })
       .from(deals)
-      .where(and(eq(deals.buyerMemberId, s.buyerMemberId), eq(deals.status, 'settled')));
+      .where(
+        and(
+          eq(deals.buyerMemberId, s.buyerMemberId),
+          eq(deals.status, 'settled'),
+          isNotNull(deals.releaseAmount),
+        ),
+      );
     const [buyerDefaults] = await db
       .select({ defaults: sql<number>`count(*)::float8` })
       .from(settlementInstructions)
@@ -54,6 +65,21 @@ export class HistorySignalProvider implements SignalProvider {
       .select({ id: deals.id, amount: deals.amount, releaseAmount: deals.releaseAmount })
       .from(deals)
       .where(and(eq(deals.sellerMemberId, s.sellerMemberId), eq(deals.status, 'settled')));
+    // The seller's own record, which unlike a list price in the deal cannot be left out or inflated.
+    const [pricing] = await db
+      .select({
+        pricedDeals: sql<number>`count(*)::float8`,
+        medianUnitPrice: sql<number>`coalesce(percentile_cont(0.5) within group (order by ${deals.amount}::float8 / ${deals.quantity}), 0)::float8`,
+      })
+      .from(deals)
+      .where(
+        and(
+          eq(deals.sellerMemberId, s.sellerMemberId),
+          eq(deals.currency, s.currency),
+          eq(deals.status, 'settled'),
+          excludeSelf,
+        ),
+      );
     const late = sellerDeals.length
       ? await db
           .select({ n: sql<number>`count(distinct ${dealEvents.dealId})::float8` })
@@ -81,11 +107,17 @@ export class HistorySignalProvider implements SignalProvider {
         medianQuantity: buyerAgent?.medianQuantity ?? 0,
         medianAmount: buyerAgent?.medianAmount ?? 0,
       },
-      buyer: { completedDeals: buyer?.completedDeals ?? 0, defaults: buyerDefaults?.defaults ?? 0 },
+      buyer: {
+        completedDeals: buyer?.completedDeals ?? 0,
+        counterparties: buyer?.counterparties ?? 0,
+        defaults: buyerDefaults?.defaults ?? 0,
+      },
       seller: {
         completedDeals: sellerDeals.length,
         onTimeRate: sellerDeals.length ? 1 - late / sellerDeals.length : 1,
         defectRate: sellerDeals.length ? shortfall / sellerDeals.length : 0,
+        pricedDeals: pricing?.pricedDeals ?? 0,
+        medianUnitPrice: pricing?.medianUnitPrice ?? 0,
       },
     };
   }

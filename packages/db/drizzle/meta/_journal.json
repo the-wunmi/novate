@@ -15,6 +15,97 @@
       "when": 1793201132502,
       "tag": "0001_ledger_append_only",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794131764651,
+      "tag": "0002_decisions_money_core",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1794131765386,
+      "tag": "0003_drop_approvals",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1794134567588,
+      "tag": "0004_fx_rate_samples",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1794135814079,
+      "tag": "0005_deal_confirmation",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1794136894615,
+      "tag": "0006_api_rate_windows",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "7",
+      "when": 1794137764445,
+      "tag": "0007_rail_attempts_cursors",
+      "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "7",
+      "when": 1794165867875,
+      "tag": "0008_portfolio_margin",
+      "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "7",
+      "when": 1794167664424,
+      "tag": "0009_deal_event_seq",
+      "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "7",
+      "when": 1794171249124,
+      "tag": "0010_decision_outcomes_shadow",
+      "breakpoints": true
+    },
+    {
+      "idx": 11,
+      "version": "7",
+      "when": 1794171927795,
+      "tag": "0011_fair_track_record",
+      "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "7",
+      "when": 1794174194564,
+      "tag": "0012_x402_payments",
+      "breakpoints": true
+    },
+    {
+      "idx": 13,
+      "version": "7",
+      "when": 1794201828425,
+      "tag": "0013_card_payments",
+      "breakpoints": true
+    },
+    {
+      "idx": 14,
+      "version": "7",
+      "when": 1794204338489,
+      "tag": "0014_first_run",
+      "breakpoints": true
     }
   ]
 }

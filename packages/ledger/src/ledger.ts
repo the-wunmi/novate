@@ -52,6 +52,23 @@ export class PostgresLedger implements Ledger {
       }
     }
 
+    const specs = new Map<string, AccountSpec>();
+    for (const t of transfers) {
+      specs.set(t.debit.code, t.debit);
+      specs.set(t.credit.code, t.credit);
+    }
+    const ids = await this.#ensureAccounts(tx, tenantId, [...specs.values()]);
+
+    // Lock touched accounts in a stable order so concurrent batches cannot deadlock. This comes
+    // before the duplicate check, so a concurrent post of the same keys is seen once it commits.
+    const lockOrder = [...ids.values()].sort();
+    await tx.execute(
+      sql`SELECT id FROM ledger_accounts WHERE id IN (${sql.join(
+        lockOrder.map((id) => sql`${id}`),
+        sql`, `,
+      )}) ORDER BY id FOR UPDATE`,
+    );
+
     const keys = transfers.map((t) => t.key);
     const existing = await tx
       .select({ key: ledgerTransfers.idempotencyKey, batchId: ledgerTransfers.batchId })
@@ -67,22 +84,6 @@ export class PostgresLedger implements Ledger {
         existing: existing.map((e) => e.key),
       });
     }
-
-    const specs = new Map<string, AccountSpec>();
-    for (const t of transfers) {
-      specs.set(t.debit.code, t.debit);
-      specs.set(t.credit.code, t.credit);
-    }
-    const ids = await this.#ensureAccounts(tx, tenantId, [...specs.values()]);
-
-    // Lock touched accounts in a stable order so concurrent batches cannot deadlock.
-    const lockOrder = [...ids.values()].sort();
-    await tx.execute(
-      sql`SELECT id FROM ledger_accounts WHERE id IN (${sql.join(
-        lockOrder.map((id) => sql`${id}`),
-        sql`, `,
-      )}) ORDER BY id FOR UPDATE`,
-    );
 
     const batchId = randomUUID();
     await tx.insert(ledgerTransfers).values(

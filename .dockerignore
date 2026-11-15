@@ -1,0 +1,5 @@
+.env
+.git
+.turbo
+**/node_modules
+packages/agents/eval/reports

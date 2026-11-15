@@ -13,12 +13,20 @@
     "start": "tsx --env-file=../../.env src/server.ts"
   },
   "dependencies": {
+    "@hono/node-server": "^2.1.5",
+    "@metalntwx/metal-pay": "^0.3.4",
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@novate/agents": "workspace:*",
     "@novate/core": "workspace:*",
+    "@novate/db": "workspace:*",
     "@novate/engine": "workspace:*",
     "@novate/policy": "workspace:*",
+    "@novate/rails": "workspace:*",
+    "@x402/core": "^2.30.0",
     "hono": "^4.13.14",
-    "@hono/node-server": "^2.1.5",
-    "zod": "^4.6.7",
-    "@novate/db": "workspace:*"
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "viem": "2.57.7"
   }
 }

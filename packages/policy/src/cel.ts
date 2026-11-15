@@ -12,14 +12,22 @@ import { DomainError } from '@novate/core';
 const env = new Environment({
   unlistedVariablesAreDyn: true,
   enableOptionalTypes: true,
-  limits: { maxAstNodes: 2_000, maxDepth: 64 },
+  limits: { maxAstNodes: 500, maxDepth: 32 },
 });
 
 const cache = new Map<string, ReturnType<Environment['parse']>>();
+const MAX_CACHED = 5_000;
+
+/** Nested comprehensions multiply: seven levels over short lists never finish. */
+const MAX_COMPREHENSIONS = 2;
+const COMPREHENSION = /\.(map|filter|all|exists|exists_one)\s*\(/g;
 
 function compiled(expr: string) {
   let fn = cache.get(expr);
   if (!fn) {
+    if ((expr.match(COMPREHENSION)?.length ?? 0) > MAX_COMPREHENSIONS) {
+      throw new DomainError('policy_error', `Too many comprehensions in: ${expr}`);
+    }
     try {
       fn = env.parse(expr);
     } catch (err) {
@@ -27,6 +35,7 @@ function compiled(expr: string) {
         cause: (err as Error).message,
       });
     }
+    if (cache.size >= MAX_CACHED) cache.clear();
     cache.set(expr, fn);
   }
   return fn;

@@ -20,12 +20,36 @@ export const Accounts = {
     normal: 'credit',
     noOverdraft: true,
   }),
-  /** Member's position within a clearing cycle. May go negative: a net debtor owes the house. */
-  memberSettlement: (memberId: string, currency: Currency): AccountSpec => ({
-    code: `member:${memberId}:${currency}:settlement`,
+  /**
+   * A member's position within one clearing cycle. May go negative: a net debtor owes the house.
+   * Per cycle, so two groups settling at once can never pay out each other's money.
+   */
+  cycleSettlement: (cycleId: string, memberId: string, currency: Currency): AccountSpec => ({
+    code: `cycle:${cycleId}:${memberId}:${currency}:settlement`,
     currency,
     normal: 'credit',
     noOverdraft: false,
+  }),
+  /** What a member owes the house outside any cycle, such as a recalled deposit already spent. */
+  memberDebt: (memberId: string, currency: Currency): AccountSpec => ({
+    code: `member:${memberId}:${currency}:debt`,
+    currency,
+    normal: 'credit',
+    noOverdraft: false,
+  }),
+  /** A member's contribution to the mutual default fund. Used only when a member defaults. */
+  memberDefaultFund: (memberId: string, currency: Currency): AccountSpec => ({
+    code: `member:${memberId}:${currency}:default_fund`,
+    currency,
+    normal: 'credit',
+    noOverdraft: true,
+  }),
+  /** Collateral a member has posted against all of its open positions. */
+  memberPortfolioMargin: (memberId: string, currency: Currency): AccountSpec => ({
+    code: `member:${memberId}:${currency}:portfolio_margin`,
+    currency,
+    normal: 'credit',
+    noOverdraft: true,
   }),
   /** Buyer funds locked against one deal. */
   dealEscrow: (dealId: string, currency: Currency): AccountSpec => ({
@@ -48,6 +72,27 @@ export const Accounts = {
     normal: 'debit',
     noOverdraft: true,
   }),
+  /** What a rail's own fees have taken from the house's money on it, which no member's cash covers. */
+  houseFeesPaid: (rail: string, currency: Currency): AccountSpec => ({
+    code: `house:${rail}:${currency}:fees_paid`,
+    currency,
+    normal: 'credit',
+    noOverdraft: false,
+  }),
+  /** The house's cost of using its rails. */
+  houseRailFees: (currency: Currency): AccountSpec => ({
+    code: `house:${currency}:rail_fees`,
+    currency,
+    normal: 'debit',
+    noOverdraft: false,
+  }),
+  /** Cash set aside for payouts already sent to a rail, so two cycles cannot spend it twice. */
+  houseInFlight: (rail: string, currency: Currency): AccountSpec => ({
+    code: `house:${rail}:${currency}:in_flight`,
+    currency,
+    normal: 'debit',
+    noOverdraft: true,
+  }),
   /** Novation account: the house as buyer to every seller and seller to every buyer. Nets to zero. */
   houseClearing: (currency: Currency): AccountSpec => ({
     code: `house:${currency}:clearing`,
@@ -55,10 +100,25 @@ export const Accounts = {
     normal: 'credit',
     noOverdraft: false,
   }),
-  houseFees: (currency: Currency): AccountSpec => ({
-    code: `house:${currency}:fees`,
+  /** The house's position while currencies are being exchanged. Flat when a cycle closes. */
+  houseFx: (currency: Currency): AccountSpec => ({
+    code: `house:${currency}:fx`,
+    currency,
+    normal: 'credit',
+    noOverdraft: false,
+  }),
+  /** Money that has reached a rail account and is not yet matched to a member. The house owes it. */
+  houseSuspense: (currency: Currency): AccountSpec => ({
+    code: `house:${currency}:suspense`,
     currency,
     normal: 'credit',
     noOverdraft: true,
+  }),
+  /** Losses the house absorbed covering a default as principal. */
+  houseDefaultLoss: (currency: Currency): AccountSpec => ({
+    code: `house:${currency}:default_loss`,
+    currency,
+    normal: 'debit',
+    noOverdraft: false,
   }),
 } as const;

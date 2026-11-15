@@ -11,6 +11,8 @@
     "test": "vitest run --passWithNoTests"
   },
   "dependencies": {
-    "@novate/core": "workspace:*"
+    "@metalntwx/metal-ts": "0.3.2",
+    "@novate/core": "workspace:*",
+    "viem": "2.57.7"
   }
 }

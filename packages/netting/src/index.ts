@@ -88,9 +88,7 @@ export function net(
     else p.payout = finalBalance;
   }
 
-  const list = [...positions.values()].sort(
-    (a, b) => a.currency.localeCompare(b.currency) || a.member.localeCompare(b.member),
-  );
+  const list = sorted(positions);
   return { mode, positions: list, totals: totals(obligations, list) };
 }
 
@@ -123,11 +121,14 @@ function netPairwise(
       }
     }
   }
-  const list = [...merged.values()].sort(
-    (a, b) => a.currency.localeCompare(b.currency) || a.member.localeCompare(b.member),
-  );
+  const list = sorted(merged);
   return { mode, positions: list, totals: totals(obligations, list) };
 }
+
+const sorted = (positions: Map<string, Position>) =>
+  [...positions.values()].sort(
+    (a, b) => a.currency.localeCompare(b.currency) || a.member.localeCompare(b.member),
+  );
 
 function totals(obligations: NettableObligation[], positions: Position[]): NettingResult['totals'] {
   const out: NettingResult['totals'] = {};

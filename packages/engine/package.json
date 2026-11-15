@@ -17,6 +17,7 @@
     "@novate/policy": "workspace:*",
     "@novate/signals": "workspace:*",
     "@novate/netting": "workspace:*",
+    "@novate/fx": "workspace:*",
     "@novate/rails": "workspace:*",
     "@dbos-inc/dbos-sdk": "^5.3.0",
     "@dbos-inc/drizzle-datasource": "^5.3.0",
@@ -25,6 +26,7 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@novate/agents": "workspace:*",
     "@types/pg": "^8.23.1"
   }
 }

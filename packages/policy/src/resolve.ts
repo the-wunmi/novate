@@ -108,12 +108,22 @@ export function resolvePolicy(program: ProgramSpec, ctx: RuleContext): ResolvedP
   };
 }
 
-export function toCelVars(ctx: RuleContext): Record<string, unknown> {
-  return { deal: ctx.deal, buyer: ctx.buyer, seller: ctx.seller, signals: ctx.signals };
-}
+const toCelVars = (ctx: RuleContext): Record<string, unknown> => ({
+  deal: ctx.deal,
+  buyer: ctx.buyer,
+  seller: ctx.seller,
+  signals: ctx.signals,
+});
 
 function pickCore(program: ProgramSpec): Record<string, unknown> {
-  const { name: _n, description: _d, signals: _s, overrides: _o, ...core } = program;
+  const {
+    name: _n,
+    description: _d,
+    signals: _s,
+    overrides: _o,
+    dealShape: _ds,
+    ...core
+  } = program;
   return structuredClone(core) as Record<string, unknown>;
 }
 

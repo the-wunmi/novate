@@ -15,12 +15,23 @@ export interface Money {
   currency: Currency;
 }
 
-/** Accepts bigint, an integer, or a numeric string of minor units (e.g. "1400000" = €14,000.00). */
-export const MinorAmount = z
-  .union([z.bigint(), z.int(), z.string().regex(/^-?\d+$/)])
-  .transform((v) => BigInt(v));
+/** Far above any real payment, and low enough that totals cannot overflow a Postgres bigint. */
+export const MAX_MINOR = 1_000_000_000_000_000n;
 
-export const MoneySchema = z.object({ amount: MinorAmount, currency: Currency });
+/** Accepts bigint, an integer, or a numeric string of minor units (e.g. "1400000" = €14,000.00). */
+/**
+ * Whole minor units. Code can pass a bigint, but the schema that agents read describes only what
+ * JSON can carry, because JSON Schema has no bigint.
+ */
+export const MinorAmount = z
+  .preprocess(
+    (v) => (typeof v === 'bigint' ? v.toString() : v),
+    z.union([z.int(), z.string().regex(/^-?\d{1,16}$/)]),
+  )
+  .transform((v) => BigInt(v))
+  .refine((v) => v <= MAX_MINOR && v >= -MAX_MINOR, {
+    message: 'Amount is too large',
+  }) as unknown as z.ZodType<bigint, bigint | number | string>;
 
 export function money(amount: bigint | number, currency: Currency): Money {
   return { amount: BigInt(amount), currency };
@@ -55,6 +66,38 @@ export function applyBps(amount: bigint, bps: bigint | number): bigint {
   return q;
 }
 
+const E8 = 100_000_000n;
+const pow10 = (n: number) => 10n ** BigInt(n);
+
+/** Buy amount (minor units) for a sell amount at a rate of buy major per sell major, times 10^8. */
+export function fxBuyAmount(
+  sell: bigint,
+  rateE8: bigint,
+  sellCurrency: Currency,
+  buyCurrency: Currency,
+): bigint {
+  const numerator = sell * rateE8 * pow10(minorUnits(buyCurrency));
+  const denominator = E8 * pow10(minorUnits(sellCurrency));
+  return numerator / denominator;
+}
+
+/** Sell amount (minor units, rounded up) needed to buy `buy` at a rate. */
+export function fxSellAmount(
+  buy: bigint,
+  rateE8: bigint,
+  sellCurrency: Currency,
+  buyCurrency: Currency,
+): bigint {
+  const numerator = buy * E8 * pow10(minorUnits(sellCurrency));
+  const denominator = rateE8 * pow10(minorUnits(buyCurrency));
+  return (numerator + denominator - 1n) / denominator;
+}
+
+/** `amount × part ÷ whole`, rounded up. */
+export function mulDivUp(amount: bigint, part: bigint, whole: bigint): bigint {
+  return (amount * part + whole - 1n) / whole;
+}
+
 export function sum(values: Iterable<bigint>): bigint {
   let total = 0n;
   for (const v of values) total += v;
@@ -62,4 +105,5 @@ export function sum(values: Iterable<bigint>): bigint {
 }
 
 export const minBig = (a: bigint, b: bigint) => (a < b ? a : b);
+export const absBig = (v: bigint) => (v < 0n ? -v : v);
 export const maxBig = (a: bigint, b: bigint) => (a > b ? a : b);

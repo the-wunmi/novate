@@ -16,7 +16,13 @@
     "db:down": "docker compose down",
     "db:generate": "pnpm --filter @novate/db generate",
     "db:migrate": "pnpm --filter @novate/db migrate",
-    "dev:api": "pnpm --filter @novate/api dev"
+    "dev:api": "pnpm --filter @novate/api dev",
+    "eval": "tsx --env-file=.env packages/agents/eval/run.ts",
+    "reset-operator-key": "tsx --env-file=.env apps/api/src/reset-operator-key.ts",
+    "demo": "tsx --env-file=.env packages/engine/test/demo.ts",
+    "demo:live": "tsx --env-file=.env apps/api/src/demo-live.ts",
+    "webhook:register": "tsx --env-file=.env apps/api/src/register-webhook.ts",
+    "pay:airi": "tsx --env-file=.env apps/api/src/pay-with-airi.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.6.3",
