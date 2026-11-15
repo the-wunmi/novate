@@ -363,9 +363,14 @@ never removed, the case table, or mutable), which holds all the trigger SQL; `ru
 reinstalls the triggers after every migration, and a test fails on an unclassified table. In production run the server as `novate_app`, which can only read and append to
 those tables: set `NOVATE_MIGRATION_DATABASE_URL` to the owner's connection and `DATABASE_URL` to
 `novate_app`'s. Boot migrates as the owner and applies `grantAppRole` (`packages/db/src/least-privilege.ts`)
-again, so new tables get the right grants; `pnpm db:grant` does it by hand. The role is created
-without a password: `ALTER ROLE novate_app PASSWORD '...'` once. The DBOS system database may keep
-the owner. Dev and tests use the owner throughout.
+again, so new tables get the right grants; `pnpm db:grant` does it by hand. The role cannot create
+schemas, so boot also installs DBOS's transaction schema through the owner (`installWorkflowSchema`)
+and the engine only checks it (`workflowSchemaInstalled`). The role is created without a password:
+`ALTER ROLE novate_app PASSWORD '...'` once, or create it with one before the first boot. The DBOS
+system database may keep the owner. Dev and tests use the owner throughout.
+`docker compose --profile app up -d --build` runs Postgres and the server this way, with
+`POSTGRES_PASSWORD` and `NOVATE_APP_DB_PASSWORD` from `.env`; put a reverse proxy in front of
+`127.0.0.1:4500` and set `NOVATE_PUBLIC_URL` and `NOVATE_TRUST_PROXY_HOPS`.
 
 Anything the outside world should hear about is a `Notification` in `notifications.ts`, sent with
 `notify`. Each one is its own durable workflow that retries for hours, so a restart cannot lose it

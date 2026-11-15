@@ -1,3 +1,7 @@
+# Postgres for development and tests, plus the API (which serves the console) under the `app` profile.
+#   Development: pnpm db:up                                 (Postgres only)
+#   Server:      docker compose --profile app up -d --build  (Postgres and the API)
+# Secrets come from .env, which Compose reads from this directory.
 services:
   postgres:
     image: postgres:17-alpine
@@ -5,7 +9,7 @@ services:
     command: ["postgres", "-c", "max_connections=300"]
     environment:
       POSTGRES_USER: novate
-      POSTGRES_PASSWORD: novate
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-novate}
       POSTGRES_DB: novate
     ports:
       - "127.0.0.1:5433:5432"
@@ -16,5 +20,44 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
+
+  # The server runs as novate_app, which can only read and append to the audit tables; boot
+  # migrates through the owner's connection and grants the role again.
+  api:
+    profiles: [app]
+    build: .
+    image: novate
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      PORT: "4000"
+      DATABASE_URL: postgres://novate_app:${NOVATE_APP_DB_PASSWORD:?Set NOVATE_APP_DB_PASSWORD in .env}@postgres:5432/novate
+      NOVATE_MIGRATION_DATABASE_URL: postgres://novate:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/novate
+      DBOS_SYSTEM_DATABASE_URL: postgres://novate:${POSTGRES_PASSWORD}@postgres:5432/novate_dbos
+    ports:
+      - "127.0.0.1:${NOVATE_HOST_PORT:-4500}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:4000/ready').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      start_period: 60s
+      retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
 volumes:
   pgdata:

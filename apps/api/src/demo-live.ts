@@ -192,9 +192,10 @@ const app = createApp({
 const server = serve({
   // The node server's bindings carry the socket, which sign-in rate limits key on.
   fetch: async (req: Request, env: unknown) => {
-    // The tunnel exists for Airwallex's webhooks; the demo's known passwords stay on localhost.
+    // The tunnel exists for Airwallex's webhooks (and the check that it answers); the demo's known
+    // passwords stay on localhost.
     const { host, pathname } = new URL(req.url);
-    if (host === tunnelHost && !pathname.startsWith('/rails/')) {
+    if (host === tunnelHost && !pathname.startsWith('/rails/') && pathname !== '/health') {
       return new Response('Not found', { status: 404 });
     }
     const res = await app.fetch(req, env);

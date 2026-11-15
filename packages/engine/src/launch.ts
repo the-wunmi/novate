@@ -39,6 +39,11 @@ export interface LaunchOptions {
   firstUsers?: FirstUsers;
   /** The rail whose rates are sampled to measure volatility. */
   fxSampleRail?: string;
+  /**
+   * The owner installed DBOS's transaction schema (`installWorkflowSchema`), so the engine only
+   * checks it. Set when the server runs as a role that cannot create schemas.
+   */
+  workflowSchemaInstalled?: boolean;
   /** Run settlement, reconciliation and monitoring on schedules. Off in tests. */
   schedules?: boolean;
   /** Scales retry pauses, polls and settle windows. Leave unset outside tests. */
@@ -69,6 +74,8 @@ export async function launchEngine(opts: LaunchOptions) {
     'app',
     { connectionString: databaseUrl, max: poolSize },
     schema,
+    'dbos',
+    { runMigrations: !opts.workflowSchemaInstalled },
   );
 
   const signals = opts.signals ?? new SignalRegistry();
@@ -120,4 +127,14 @@ export async function launchEngine(opts: LaunchOptions) {
       await pool.end();
     },
   };
+}
+
+/**
+ * Install DBOS's transaction schema in the app database through the owner's connection, and let
+ * `role` use it, for a server that runs as a role without CREATE.
+ */
+export function installWorkflowSchema(ownerUrl: string, role: string): Promise<void> {
+  return DrizzleDataSource.initializeDBOSSchema({ connectionString: ownerUrl }, 'dbos', {
+    applicationRole: role,
+  });
 }

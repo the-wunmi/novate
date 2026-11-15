@@ -2,7 +2,12 @@ import { serve } from '@hono/node-server';
 import { ClaudeDecisionAgent, ClaudeDocumentReader, ClaudeModelClient } from '@novate/agents';
 import { grantAppRole } from '@novate/db/least-privilege';
 import { runMigrations } from '@novate/db/migrate';
-import { DEFAULT_FIRST_USERS, launchEngine, PostgresMetalAttempts } from '@novate/engine';
+import {
+  DEFAULT_FIRST_USERS,
+  installWorkflowSchema,
+  launchEngine,
+  PostgresMetalAttempts,
+} from '@novate/engine';
 import { AirwallexRail, createMetalClient, MetalRail, MockRail, RailRegistry } from '@novate/rails';
 import { createApp } from './app.ts';
 import { authFromEnv, databasesFromEnv } from './env.ts';
@@ -54,7 +59,9 @@ const port = Number(process.env.PORT ?? 4000);
 const ownerUrl = process.env.NOVATE_MIGRATION_DATABASE_URL;
 await runMigrations(ownerUrl ?? databases.databaseUrl);
 if (ownerUrl) {
-  await grantAppRole(ownerUrl, decodeURIComponent(new URL(databases.databaseUrl).username));
+  const role = decodeURIComponent(new URL(databases.databaseUrl).username);
+  await grantAppRole(ownerUrl, role);
+  await installWorkflowSchema(ownerUrl, role);
 }
 const rails = railsFromEnv();
 const model = process.env.ANTHROPIC_API_KEY ? new ClaudeModelClient() : undefined;
@@ -76,6 +83,7 @@ const engine = await launchEngine({
     .map((r) => r.name)
     .filter((name) => name !== 'mock'),
   schedules: true,
+  workflowSchemaInstalled: Boolean(ownerUrl),
   firstUsers: {
     house: process.env.NOVATE_ADMIN_EMAIL || DEFAULT_FIRST_USERS.house,
     platform: process.env.NOVATE_PLATFORM_ADMIN_EMAIL || DEFAULT_FIRST_USERS.platform,

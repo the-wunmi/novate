@@ -571,7 +571,8 @@ function WhatIf({ trail, programId }: { trail: Trail; programId?: string }) {
   const recheck = useMutation({
     mutationFn: (minor: bigint) =>
       api<Recheck>(`/tenants/${tenantId}/decisions/${trail.case.id}/recheck`, {
-        body: { ceiling: { [currency]: String(minor) } },
+        // Program ceilings are plain numbers of minor units, as in the program spec.
+        body: { ceiling: { [currency]: Number(minor) } },
       }),
   });
   if (amount <= 0n || !canAct) return null;

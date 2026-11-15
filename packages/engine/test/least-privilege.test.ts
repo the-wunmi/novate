@@ -14,6 +14,7 @@ import { getTableName, is } from 'drizzle-orm';
 import { PgTable } from 'drizzle-orm/pg-core';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { installWorkflowSchema } from '../src/index.ts';
 
 // Roles belong to the whole server, so this one has a name no other run can share.
 const role = `novate_app_${randomUUID().slice(0, 8)}`;
@@ -25,6 +26,7 @@ beforeAll(async () => {
   await grantAppRole(url, role);
   // Twice, as every boot after a migration does.
   await grantAppRole(url, role);
+  await installWorkflowSchema(url, role);
   client = new pg.Client({ connectionString: url });
   await client.connect();
 }, 60_000);
@@ -69,6 +71,14 @@ describe('the application role', () => {
     ]) {
       await expect(asApp(statement), statement).rejects.toThrow(/permission denied/);
     }
+  });
+
+  it('uses the workflow schema the owner installed, and cannot create one', async () => {
+    await asApp('select output from dbos.transaction_completion limit 1');
+    await asApp(
+      `insert into dbos.transaction_completion (workflow_id, function_num, output) values ('t', 0, null)`,
+    );
+    await expect(asApp('create schema dbos_by_app')).rejects.toThrow(/permission denied/);
   });
 
   it('works everything else as before, a case’s status included', async () => {

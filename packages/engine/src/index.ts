@@ -60,7 +60,12 @@ export {
   isOperatorKey,
   resetOperatorKey,
 } from './instance-setup.ts';
-export { type Engine, type LaunchOptions, launchEngine } from './launch.ts';
+export {
+  type Engine,
+  installWorkflowSchema,
+  type LaunchOptions,
+  launchEngine,
+} from './launch.ts';
 export {
   memberAccount,
   memberWithdrawals,
